@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+motor
+pymongo
+python-multipart
+openai
+python-dotenv
+numpy
+python-docx
+pypdf
