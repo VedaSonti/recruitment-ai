@@ -21,7 +21,11 @@ import os
 import json
 import hashlib
 import tempfile
-from datetime import datetime, timezone
+import smtplib
+import secrets
+from datetime import datetime, timezone, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from typing import Optional
 from bson import ObjectId
 
@@ -40,13 +44,62 @@ from prompts import (
     build_embedding_text_from_candidate,
 )
 from file_loader import load_text_file
-from db import jobs_collection, candidates_collection, matches_collection
+from db import jobs_collection, candidates_collection, matches_collection, interviews_collection
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "")
+EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "iSOFT Recruitment")
+
 CHAT_MODEL = "gpt-4o-mini"
 EMBED_MODEL = "text-embedding-3-small"
+
+def send_email(to_address: str, subject: str, html_body: str) -> bool:
+    """
+    Send an email using Gmail SMTP.
+    Returns True if sent successfully, False otherwise.
+    Isolated here so switching to Resend later only requires
+    changing this function body - no other code changes needed.
+
+    TO SWITCH TO RESEND LATER: replace only this function body with:
+        import resend
+        resend.api_key = os.getenv("RESEND_API_KEY")
+        resend.Emails.send({
+            "from": f"{EMAIL_FROM_NAME} <{EMAIL_FROM}>",
+            "to": to_address,
+            "subject": subject,
+            "html": html_body,
+        })
+        return True
+    """
+    if not SMTP_USER or not SMTP_PASSWORD:
+        print("[email] SMTP credentials not configured - skipping send")
+        return False
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = f"{EMAIL_FROM_NAME} <{EMAIL_FROM or SMTP_USER}>"
+        msg["To"] = to_address
+        msg.attach(MIMEText(html_body, "html"))
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_FROM or SMTP_USER, to_address, msg.as_string())
+
+        print(f"[email] Sent '{subject}' to {to_address}")
+        return True
+    except Exception as e:
+        print(f"[email] Failed to send to {to_address}: {e}")
+        return False
 
 app = FastAPI(title="Recruitment AI API")
 app.add_middleware(
@@ -411,6 +464,324 @@ async def get_skill_analysis(match_id: str):
 
     return result
 
+
+@app.post("/interviews/schedule/{match_id}")
+async def schedule_interview(match_id: str):
+    """
+    Schedule an AI interview for a shortlisted candidate.
+    Generates questions, creates interview document, sends invitation email.
+    Updates match status to Interview Sent.
+    """
+    match = await matches_collection.find_one({"_id": ObjectId(match_id)})
+    if not match:
+        raise HTTPException(404, "Match not found")
+
+    candidate = await candidates_collection.find_one({"_id": match["candidate_id"]})
+    job = await jobs_collection.find_one({"_id": match["job_id"]})
+
+    if not candidate or not job:
+        raise HTTPException(404, "Candidate or job not found")
+    if not candidate.get("email"):
+        raise HTTPException(400, "Candidate has no email address on file")
+
+    # Reuse interview questions from existing AI analysis if available
+    existing_analysis = match.get("analysis") or {}
+    questions = existing_analysis.get("interview_questions") or []
+
+    if not questions:
+        prompt = f"""Generate exactly 5 interview questions for this role.
+Job title: {job.get('title')}
+Required skills: {', '.join(job.get('required_skills', []))}
+Candidate summary: {candidate.get('summary', '')}
+
+Rules:
+- Questions must be specific to this role and the candidate's background
+- Mix of technical and behavioural questions
+- Each question should take 1-2 minutes to answer verbally
+- Do not ask yes/no questions
+- Return ONLY a JSON array of 5 strings, no other text
+Example: ["Question 1?", "Question 2?", "Question 3?", "Question 4?", "Question 5?"]"""
+
+        q_response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5,
+        )
+        questions = json.loads(q_response.choices[0].message.content)
+
+    token = secrets.token_urlsafe(48)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=7)
+
+    interview_doc = {
+        "match_id": ObjectId(match_id),
+        "job_id": match["job_id"],
+        "candidate_id": match["candidate_id"],
+        "candidate_name": candidate.get("name"),
+        "candidate_email": candidate.get("email"),
+        "job_title": job.get("title"),
+        "token": token,
+        "questions": questions,
+        "status": "Invited",
+        "responses": [],
+        "assessment": None,
+        "scheduled_at": None,
+        "expires_at": expires_at,
+        "created_at": now,
+    }
+    await interviews_collection.insert_one(interview_doc)
+
+    await matches_collection.update_one(
+        {"_id": ObjectId(match_id)},
+        {"$set": {"status": "Interview Sent", "updated_at": now}}
+    )
+
+    interview_url = f"{FRONTEND_URL}/interview/{token}"
+    email_html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+      <h2 style="color:#7B1111;">Interview Invitation - {job.get('title')}</h2>
+      <p>Dear {candidate.get('name')},</p>
+      <p>Congratulations! You have been shortlisted for the
+         <strong>{job.get('title')}</strong> position.</p>
+      <p>Please complete an AI-powered screening interview at your convenience.
+         The interview has <strong>{len(questions)} questions</strong> and takes
+         approximately {len(questions) * 2}-{len(questions) * 3} minutes.</p>
+      <div style="text-align:center;margin:30px 0;">
+        <a href="{interview_url}"
+           style="background:#7B1111;color:#fff;padding:14px 28px;
+                  text-decoration:none;border-radius:8px;font-size:16px;">
+          Start Your Interview
+        </a>
+      </div>
+      <p style="color:#666;">This link expires on
+         {expires_at.strftime('%B %d, %Y')}.</p>
+      <p>Best regards,<br>iSOFT Recruitment Team</p>
+    </div>"""
+
+    email_sent = send_email(
+        to_address=candidate.get("email"),
+        subject=f"Interview Invitation - {job.get('title')}",
+        html_body=email_html,
+    )
+
+    return {
+        "message": "Interview scheduled"
+                   + (" and invitation sent" if email_sent else
+                      " (email not sent - check SMTP config)"),
+        "token": token,
+        "interview_url": interview_url,
+        "candidate_email": candidate.get("email"),
+        "expires_at": expires_at.isoformat(),
+        "email_sent": email_sent,
+    }
+
+
+@app.get("/interviews/by-match/{match_id}")
+async def get_interview_by_match(match_id: str):
+    """Recruiter views interview results for a specific match."""
+    interview = await interviews_collection.find_one(
+        {"match_id": ObjectId(match_id)}
+    )
+    if not interview:
+        raise HTTPException(404, "No interview found for this match")
+    return {
+        "interview_id": str(interview["_id"]),
+        "candidate_name": interview["candidate_name"],
+        "candidate_email": interview["candidate_email"],
+        "job_title": interview["job_title"],
+        "status": interview["status"],
+        "questions": interview["questions"],
+        "responses": interview.get("responses", []),
+        "assessment": interview.get("assessment"),
+        "expires_at": interview["expires_at"].isoformat(),
+        "created_at": interview["created_at"].isoformat(),
+    }
+
+
+@app.get("/interviews/{token}")
+async def get_interview(token: str):
+    """Public - candidate fetches their interview details via email link."""
+    interview = await interviews_collection.find_one({"token": token})
+    if not interview:
+        raise HTTPException(404, "Interview not found")
+    now = datetime.now(timezone.utc)
+    if interview["expires_at"].replace(tzinfo=timezone.utc) < now:
+        await interviews_collection.update_one(
+            {"token": token}, {"$set": {"status": "Expired"}}
+        )
+        raise HTTPException(410, "This interview link has expired")
+    if interview["status"] == "Completed":
+        raise HTTPException(409, "This interview has already been completed")
+    answered = len(interview.get("responses", []))
+    return {
+        "candidate_name": interview["candidate_name"],
+        "job_title": interview["job_title"],
+        "total_questions": len(interview["questions"]),
+        "questions_answered": answered,
+        "current_question_index": answered,
+        "current_question": (
+            interview["questions"][answered]
+            if answered < len(interview["questions"]) else None
+        ),
+        "status": interview["status"],
+        "expires_at": interview["expires_at"].isoformat(),
+    }
+
+
+@app.get("/interviews/{token}/question-audio/{question_index}")
+async def get_question_audio(token: str, question_index: int):
+    """Returns TTS audio of the AI reading a question aloud."""
+    from fastapi.responses import StreamingResponse
+    import io
+    interview = await interviews_collection.find_one({"token": token})
+    if not interview:
+        raise HTTPException(404, "Interview not found")
+    questions = interview.get("questions", [])
+    if question_index >= len(questions):
+        raise HTTPException(400, "Question index out of range")
+    speech = client.audio.speech.create(
+        model="tts-1",
+        voice="nova",
+        input=questions[question_index],
+    )
+    return StreamingResponse(
+        io.BytesIO(speech.content),
+        media_type="audio/mpeg",
+    )
+
+
+@app.post("/interviews/{token}/respond")
+async def submit_response(token: str, audio: UploadFile = File(...)):
+    """
+    Public - candidate submits audio for one question.
+    Transcribes with Whisper. Returns next question or completion signal.
+    """
+    interview = await interviews_collection.find_one({"token": token})
+    if not interview:
+        raise HTTPException(404, "Interview not found")
+    if interview["status"] == "Completed":
+        raise HTTPException(409, "Interview already completed")
+    now = datetime.now(timezone.utc)
+    if interview["expires_at"].replace(tzinfo=timezone.utc) < now:
+        raise HTTPException(410, "Interview link has expired")
+
+    question_index = len(interview.get("responses", []))
+    if question_index >= len(interview["questions"]):
+        raise HTTPException(400, "All questions already answered")
+
+    suffix = os.path.splitext(audio.filename or "audio.webm")[1] or ".webm"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await audio.read())
+        tmp_path = tmp.name
+    try:
+        with open(tmp_path, "rb") as f:
+            transcription = client.audio.transcriptions.create(
+                model="whisper-1", file=f,
+            )
+        transcript = transcription.text
+    finally:
+        os.remove(tmp_path)
+
+    response_doc = {
+        "question_index": question_index,
+        "question": interview["questions"][question_index],
+        "transcript": transcript,
+        "submitted_at": now.isoformat(),
+    }
+    new_responses = interview.get("responses", []) + [response_doc]
+    all_done = len(new_responses) >= len(interview["questions"])
+
+    await interviews_collection.update_one(
+        {"token": token},
+        {"$set": {
+            "responses": new_responses,
+            "status": "Completed" if all_done else "Started",
+        }}
+    )
+
+    if all_done:
+        return {"completed": True, "message": "All questions answered. Thank you!",
+                "next_question": None, "next_question_index": None}
+    return {
+        "completed": False,
+        "transcript_received": transcript[:100] + ("..." if len(transcript) > 100 else ""),
+        "next_question_index": question_index + 1,
+        "next_question": interview["questions"][question_index + 1],
+    }
+
+
+@app.post("/interviews/{token}/assess")
+async def assess_interview(token: str):
+    """
+    Called after all questions answered.
+    GPT evaluates transcripts against job requirements.
+    Updates match status to Interview Completed.
+    """
+    interview = await interviews_collection.find_one({"token": token})
+    if not interview:
+        raise HTTPException(404, "Interview not found")
+    if interview["status"] not in ("Completed", "Assessed"):
+        raise HTTPException(400, "Interview not yet completed")
+    if interview.get("assessment"):
+        return {"message": "Already assessed", "assessment": interview["assessment"]}
+
+    job = await jobs_collection.find_one({"_id": interview["job_id"]})
+    responses = interview.get("responses", [])
+
+    qa_text = "\n\n".join([
+        f"Q{i+1}: {r['question']}\nA: {r['transcript']}"
+        for i, r in enumerate(responses)
+    ])
+
+    prompt = f"""You are an experienced recruitment interviewer reviewing a candidate's responses.
+
+Job: {interview['job_title']}
+Required skills: {', '.join((job or {}).get('required_skills', []))}
+Candidate: {interview['candidate_name']}
+
+Interview transcript:
+{qa_text}
+
+Assess the responses objectively. Do not make a hiring decision - present facts only.
+
+Return ONLY valid JSON:
+{{
+  "overall_interview_score": <0-100>,
+  "summary": "2-3 sentence factual summary of how the candidate performed",
+  "answer_assessments": [
+    {{
+      "question_index": 0,
+      "question": "...",
+      "score": <0-100>,
+      "comment": "one sentence factual observation"
+    }}
+  ],
+  "key_observations": ["observation 1", "observation 2", "observation 3"],
+  "areas_to_probe": ["follow-up area 1", "follow-up area 2"]
+}}"""
+
+    gpt_response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+    )
+    assessment = json.loads(gpt_response.choices[0].message.content)
+
+    now = datetime.now(timezone.utc)
+    await interviews_collection.update_one(
+        {"token": token},
+        {"$set": {
+            "assessment": assessment,
+            "status": "Assessed",
+            "assessed_at": now.isoformat(),
+        }}
+    )
+    await matches_collection.update_one(
+        {"_id": interview["match_id"]},
+        {"$set": {"status": "Interview Completed", "updated_at": now}}
+    )
+
+    return {"message": "Assessment complete", "assessment": assessment}
 
 #________________________________________________________
 
