@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Filter, Info, Star } from "lucide-react";
 import { PageHeader } from "@/components/layout/PageHeader";
-import { Badge, statusTone } from "@/components/ui/Badge";
+import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { LoadingSpinner } from "@/components/ui/LoadingSpinner";
@@ -20,6 +20,15 @@ import {
 } from "@/src/lib/api";
 import { getJobId, getJobTitle, getMatchId, scoreToPercent } from "@/src/lib/utils";
 
+type RowAction = "approve" | "reject" | "shortlist";
+type RowActionState = Record<
+  string,
+  {
+    error?: boolean;
+    loading?: RowAction;
+  }
+>;
+
 export default function MatchResultsPage({
   params,
 }: {
@@ -32,6 +41,7 @@ export default function MatchResultsPage({
   const [query, setQuery] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isAnalysing, setIsAnalysing] = useState(false);
+  const [actionState, setActionState] = useState<RowActionState>({});
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -48,6 +58,7 @@ export default function MatchResultsPage({
         if (mounted) {
           setJobs(jobList);
           setMatches(matchList);
+          setActionState({});
         }
       } catch (requestError) {
         if (mounted) {
@@ -111,13 +122,38 @@ export default function MatchResultsPage({
     );
   }, [matches, query]);
 
-  async function updateStatus(match: Match, status: "Approved" | "Sent" | "Shortlisted") {
+  async function updateStatus(
+    match: Match,
+    status: "Approved" | "Sent" | "Shortlisted",
+    action: RowAction,
+  ) {
     const matchId = getMatchId(match);
     if (!matchId) {
       return;
     }
-    await updateMatchStatus(matchId, status);
-    setMatches(await getMatchesByJob(jobId));
+
+    setActionState((current) => ({
+      ...current,
+      [matchId]: { loading: action },
+    }));
+
+    try {
+      await updateMatchStatus(matchId, status);
+      setMatches((current) =>
+        current.map((item) =>
+          getMatchId(item) === matchId ? ({ ...item, status } as Match) : item,
+        ),
+      );
+      setActionState((current) => ({
+        ...current,
+        [matchId]: {},
+      }));
+    } catch {
+      setActionState((current) => ({
+        ...current,
+        [matchId]: { error: true },
+      }));
+    }
   }
 
   if (isLoading) {
@@ -176,18 +212,20 @@ export default function MatchResultsPage({
 
           <CandidateTable
             accented
+            actionState={actionState}
             jobId={jobId}
             matches={filtered.slice(0, 5)}
-            onApprove={(match) => updateStatus(match, "Approved")}
-            onReject={(match) => updateStatus(match, "Sent")}
+            onApprove={(match) => updateStatus(match, "Approved", "approve")}
+            onReject={(match) => updateStatus(match, "Sent", "reject")}
             title="Top 5 Recommended Candidates"
           />
 
           <CandidateTable
+            actionState={actionState}
             jobId={jobId}
             matches={filtered.slice(5)}
-            onApprove={(match) => updateStatus(match, "Shortlisted")}
-            onReject={(match) => updateStatus(match, "Sent")}
+            onApprove={(match) => updateStatus(match, "Shortlisted", "shortlist")}
+            onReject={(match) => updateStatus(match, "Sent", "reject")}
             title="Other Candidates"
           />
         </div>
@@ -234,6 +272,7 @@ function FilterPanel() {
 
 function CandidateTable({
   accented,
+  actionState,
   jobId,
   matches,
   onApprove,
@@ -241,6 +280,7 @@ function CandidateTable({
   title,
 }: {
   accented?: boolean;
+  actionState: RowActionState;
   jobId: string;
   matches: Match[];
   onApprove: (match: Match) => void;
@@ -277,6 +317,17 @@ function CandidateTable({
               const percent = scoreToPercent(match.score ?? match.match_score);
               const tech = match.analysis?.tech_match_percentage ?? Math.min(99, Math.round(percent * 1.02));
               const exp = match.analysis?.exp_match_percentage ?? Math.round(percent * 0.98);
+              const status = match.status ?? "Matched";
+              const rowState = actionState[matchId] ?? {};
+              const isBusy = Boolean(rowState.loading);
+              const approveAction = accented ? "approve" : "shortlist";
+              const approveLabel = accented ? "Approve" : "Shortlist";
+              const approveDisabled =
+                isBusy ||
+                status === "Sent" ||
+                (accented ? status === "Approved" : status === "Shortlisted");
+              const rejectDisabled = isBusy || status === "Sent";
+
               return (
                 <tr className={index === 0 && accented ? "bg-[#fbf3f5]" : "bg-white"} key={matchId || `${match.candidate_id}-${index}`}>
                   <td className="px-5 py-4">
@@ -294,21 +345,35 @@ function CandidateTable({
                   <td className="px-5 py-4 text-[14px] text-[#333438]">{exp}%</td>
                   <td className="px-5 py-4 text-[14px] font-bold text-[#00a650]">Yes</td>
                   <td className="px-5 py-4">
-                    {match.analysis ? <Badge tone="green">AI Analysed</Badge> : <Badge tone={statusTone(match.status)}>{match.status ?? "Matched"}</Badge>}
+                    <Badge tone={matchStatusTone(status)}>{status}</Badge>
                   </td>
                   <td className="px-5 py-4">
-                    <div className="flex items-center gap-3">
+                    <div className="flex flex-wrap items-center gap-3">
                       {match.candidate_id ? (
                         <Link className="text-[14px] font-bold text-crimson-700" href={`/matches/${encodeURIComponent(jobId)}/candidate/${encodeURIComponent(match.candidate_id)}`}>
                           View
                         </Link>
                       ) : null}
-                      <button className="text-[14px] font-bold text-crimson-700" onClick={() => onApprove(match)} type="button">
-                        {accented ? "Approve" : "Shortlist"}
-                      </button>
-                      <button className="text-[14px] text-[#8b8f97]" onClick={() => onReject(match)} type="button">
+                      <ActionLink
+                        disabled={approveDisabled}
+                        isLoading={rowState.loading === approveAction}
+                        onClick={() => onApprove(match)}
+                      >
+                        {approveLabel}
+                      </ActionLink>
+                      <ActionLink
+                        disabled={rejectDisabled}
+                        isLoading={rowState.loading === "reject"}
+                        muted
+                        onClick={() => onReject(match)}
+                      >
                         Reject
-                      </button>
+                      </ActionLink>
+                      {rowState.error ? (
+                        <span className="text-[12px] font-bold text-[#b91c1c]">
+                          Failed {"\u2014"} try again
+                        </span>
+                      ) : null}
                     </div>
                   </td>
                 </tr>
@@ -326,6 +391,60 @@ function CandidateTable({
       </div>
     </Card>
   );
+}
+
+function ActionLink({
+  children,
+  disabled,
+  isLoading,
+  muted,
+  onClick,
+}: {
+  children: React.ReactNode;
+  disabled: boolean;
+  isLoading: boolean;
+  muted?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      className={`inline-flex items-center gap-1 text-[14px] font-bold ${
+        disabled
+          ? "cursor-not-allowed text-[#9ca0a8]"
+          : muted
+            ? "text-[#8b8f97] hover:text-crimson-700"
+            : "text-crimson-700 hover:text-[#ff1717]"
+      }`}
+      disabled={disabled}
+      onClick={onClick}
+      type="button"
+    >
+      {isLoading ? <LoadingSpinner className="h-3.5 w-3.5" size="sm" /> : null}
+      {children}
+    </button>
+  );
+}
+
+function matchStatusTone(
+  status?: string,
+): "green" | "blue" | "indigo" | "purple" | "amber" | "red" | "grey" | "crimson" {
+  switch ((status ?? "Matched").toLowerCase()) {
+    case "matched":
+    case "interview sent":
+      return "blue";
+    case "approved":
+      return "indigo";
+    case "shortlisted":
+      return "purple";
+    case "interview completed":
+      return "green";
+    case "uplifted":
+      return "amber";
+    case "sent":
+      return "grey";
+    default:
+      return "grey";
+  }
 }
 
 function ScorePill({ value }: { value: number }) {

@@ -14,10 +14,34 @@ import {
   updateMatchStatus,
   type Job,
   type Match,
+  type MatchStatus,
 } from "@/src/lib/api";
-import { formatDate, getJobId, getJobTitle, getMatchId, initials, scoreToPercent } from "@/src/lib/utils";
+import {
+  formatDate,
+  getJobId,
+  getJobTitle,
+  getMatchId,
+  initials,
+  scoreToPercent,
+} from "@/src/lib/utils";
 
 type Disposition = "" | "Willing" | "Not Willing" | "No Show / Disappeared";
+
+type FeedbackRow = {
+  action: string;
+  comments: string;
+  date: string;
+};
+
+type RowActionState = Record<
+  string,
+  {
+    message?: string;
+    messageTone?: "success" | "error";
+    moving?: boolean;
+    saving?: boolean;
+  }
+>;
 
 const statusMap: Record<Exclude<Disposition, "">, "Approved" | "Sent" | "Matched"> = {
   Willing: "Approved",
@@ -25,17 +49,28 @@ const statusMap: Record<Exclude<Disposition, "">, "Approved" | "Sent" | "Matched
   "No Show / Disappeared": "Matched",
 };
 
+const approvedStatuses = [
+  "Approved",
+  "Shortlisted",
+  "Interview Sent",
+  "Interview Completed",
+  "Uplifted",
+];
+
 export default function CandidateReviewPage() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [selectedJobId, setSelectedJobId] = useState("");
   const [matches, setMatches] = useState<Match[]>([]);
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [dispositions, setDispositions] = useState<Record<string, Disposition>>({});
+  const [feedbackRows, setFeedbackRows] = useState<Record<string, FeedbackRow[]>>({});
+  const [rowActions, setRowActions] = useState<RowActionState>({});
   const [toast, setToast] = useState("");
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
     let mounted = true;
+
     async function loadJobs() {
       setIsLoading(true);
       const nextJobs = await getJobs();
@@ -44,7 +79,9 @@ export default function CandidateReviewPage() {
         setSelectedJobId(getJobId(nextJobs[0] ?? {}));
       }
     }
+
     loadJobs().catch(() => setIsLoading(false));
+
     return () => {
       mounted = false;
     };
@@ -52,20 +89,28 @@ export default function CandidateReviewPage() {
 
   useEffect(() => {
     let mounted = true;
+
     async function loadMatches() {
       if (!selectedJobId) {
         setMatches([]);
+        setFeedbackRows({});
+        setRowActions({});
         setIsLoading(false);
         return;
       }
+
       setIsLoading(true);
       const nextMatches = await getMatchesByJob(selectedJobId);
       if (mounted) {
         setMatches(nextMatches);
+        setFeedbackRows({});
+        setRowActions({});
         setIsLoading(false);
       }
     }
+
     loadMatches().catch(() => setIsLoading(false));
+
     return () => {
       mounted = false;
     };
@@ -75,13 +120,14 @@ export default function CandidateReviewPage() {
     if (!toast) {
       return;
     }
+
     const timer = window.setTimeout(() => setToast(""), 2200);
     return () => window.clearTimeout(timer);
   }, [toast]);
 
   const progress = useMemo(
     () => ({
-      approved: matches.filter((match) => match.status === "Approved").length,
+      approved: matches.filter((match) => approvedStatuses.includes(match.status ?? "")).length,
       rejected: matches.filter((match) => match.status === "Sent").length,
       pending: matches.filter((match) => (match.status ?? "Matched") === "Matched").length,
       total: matches.length,
@@ -89,23 +135,135 @@ export default function CandidateReviewPage() {
     [matches],
   );
 
+  function patchMatch(matchId: string, update: Partial<Match>) {
+    setMatches((current) =>
+      current.map((match) =>
+        getMatchId(match) === matchId ? ({ ...match, ...update } as Match) : match,
+      ),
+    );
+  }
+
+  function setRowLoading(matchId: string, update: Partial<RowActionState[string]>) {
+    setRowActions((current) => ({
+      ...current,
+      [matchId]: {
+        ...current[matchId],
+        ...update,
+      },
+    }));
+  }
+
+  function showRowMessage(
+    matchId: string,
+    message: string,
+    messageTone: "success" | "error",
+  ) {
+    setRowLoading(matchId, { message, messageTone });
+    window.setTimeout(() => {
+      setRowActions((current) => {
+        if (current[matchId]?.message !== message) {
+          return current;
+        }
+
+        return {
+          ...current,
+          [matchId]: {
+            ...current[matchId],
+            message: undefined,
+            messageTone: undefined,
+          },
+        };
+      });
+    }, 3000);
+  }
+
   async function save(match: Match) {
     const id = getMatchId(match);
     const disposition = dispositions[id];
-    if (!id || !disposition) {
+
+    if (!id) {
       return;
     }
-    await updateMatchStatus(id, statusMap[disposition], notes[id] ?? "");
-    setMatches(await getMatchesByJob(selectedJobId));
+
+    if (!disposition) {
+      showRowMessage(id, "Please select a status before saving", "error");
+      return;
+    }
+
+    const status = statusMap[disposition];
+    const note = notes[id] ?? "";
+    const now = new Date().toISOString();
+
+    setRowLoading(id, {
+      message: undefined,
+      messageTone: undefined,
+      saving: true,
+    });
+
+    try {
+      await updateMatchStatus(id, status, note);
+      patchMatch(id, {
+        status,
+        status_note: note,
+        updated_at: now,
+      });
+      setFeedbackRows((current) => ({
+        ...current,
+        [id]: [
+          ...(current[id] ?? []),
+          {
+            action: status,
+            comments: note,
+            date: now,
+          },
+        ],
+      }));
+      setRowLoading(id, { saving: false });
+      showRowMessage(id, "\u2713 Status saved", "success");
+    } catch {
+      setRowLoading(id, { saving: false });
+      showRowMessage(id, "Failed to save \u2014 try again", "error");
+    }
   }
 
   async function moveNext(match: Match) {
     const id = getMatchId(match);
+
     if (!id) {
       return;
     }
-    await updateMatchStatus(id, "Shortlisted", notes[id] ?? "");
-    setMatches(await getMatchesByJob(selectedJobId));
+
+    const currentStatus = (match.status ?? "Matched") as MatchStatus;
+    const nextStatus: MatchStatus | null =
+      currentStatus === "Approved"
+        ? "Shortlisted"
+        : currentStatus === "Matched"
+          ? "Approved"
+          : null;
+
+    if (!nextStatus) {
+      showRowMessage(id, "Candidate must be Matched or Approved before moving", "error");
+      return;
+    }
+
+    setRowLoading(id, {
+      message: undefined,
+      messageTone: undefined,
+      moving: true,
+    });
+
+    try {
+      await updateMatchStatus(id, nextStatus);
+      patchMatch(id, {
+        status: nextStatus,
+        updated_at: new Date().toISOString(),
+      });
+      setRowLoading(id, { moving: false });
+      showRowMessage(id, "\u2713 Moved to next stage", "success");
+    } catch {
+      setRowLoading(id, { moving: false });
+      showRowMessage(id, "Failed to move \u2014 try again", "error");
+    }
   }
 
   return (
@@ -116,7 +274,9 @@ export default function CandidateReviewPage() {
       />
 
       <div className="mb-6 flex flex-wrap items-center gap-3">
-        <span className="text-[14px] font-bold text-[#333438]">Reviewing candidates for:</span>
+        <span className="text-[14px] font-bold text-[#333438]">
+          Reviewing candidates for:
+        </span>
         <select
           className="h-10 min-w-[320px] rounded-[8px] border border-[#d8dee7] bg-white px-4 text-[14px]"
           onChange={(event) => setSelectedJobId(event.target.value)}
@@ -140,6 +300,19 @@ export default function CandidateReviewPage() {
             {matches.map((match) => {
               const id = getMatchId(match);
               const selected = dispositions[id] ?? "";
+              const actionState = rowActions[id] ?? {};
+              const feedback = feedbackRows[id]?.length
+                ? feedbackRows[id]
+                : match.status_note
+                  ? [
+                      {
+                        action: match.status ?? "Note",
+                        comments: match.status_note,
+                        date: match.updated_at ?? match.created_at ?? "",
+                      },
+                    ]
+                  : [];
+
               return (
                 <Card className="px-6 py-6" key={id}>
                   <div className="mb-5 flex items-start justify-between gap-4">
@@ -155,7 +328,10 @@ export default function CandidateReviewPage() {
                       </div>
                     </div>
                     {match.candidate_id ? (
-                      <Link className="text-[14px] font-bold text-crimson-700" href={`/matches/${encodeURIComponent(selectedJobId)}/candidate/${encodeURIComponent(match.candidate_id)}`}>
+                      <Link
+                        className="text-[14px] font-bold text-crimson-700"
+                        href={`/matches/${encodeURIComponent(selectedJobId)}/candidate/${encodeURIComponent(match.candidate_id)}`}
+                      >
                         View Details {"->"}
                       </Link>
                     ) : null}
@@ -168,7 +344,12 @@ export default function CandidateReviewPage() {
                       </span>
                       <select
                         className="h-11 w-full rounded-[8px] border border-[#d8dee7] bg-white px-4 text-[15px]"
-                        onChange={(event) => setDispositions((current) => ({ ...current, [id]: event.target.value as Disposition }))}
+                        onChange={(event) =>
+                          setDispositions((current) => ({
+                            ...current,
+                            [id]: event.target.value as Disposition,
+                          }))
+                        }
                         value={selected}
                       >
                         <option value="">Select Status</option>
@@ -186,36 +367,60 @@ export default function CandidateReviewPage() {
                   </div>
 
                   <label className="mt-5 block">
-                    <span className="mb-2 block text-[14px] font-bold text-[#333438]">Recruiter Notes</span>
+                    <span className="mb-2 block text-[14px] font-bold text-[#333438]">
+                      Recruiter Notes
+                    </span>
                     <textarea
                       className="min-h-[90px] w-full resize-none rounded-[8px] border border-[#d8dee7] px-4 py-3 text-[15px] outline-none focus:border-crimson-700"
-                      onChange={(event) => setNotes((current) => ({ ...current, [id]: event.target.value }))}
+                      onChange={(event) =>
+                        setNotes((current) => ({ ...current, [id]: event.target.value }))
+                      }
                       placeholder="Add validation notes, interview feedback, or special considerations..."
                       value={notes[id] ?? ""}
                     />
                   </label>
 
                   <div className="mt-5">
-                    <p className="mb-3 text-[14px] font-bold text-[#333438]">Feedback History</p>
+                    <p className="mb-3 text-[14px] font-bold text-[#333438]">
+                      Feedback History
+                    </p>
                     <div className="overflow-hidden rounded-[8px] border border-[#E5E7EB]">
                       <table className="w-full border-collapse text-left">
                         <thead className="bg-[#e8cfd6]">
                           <tr>
                             {["Date", "Action", "Comments"].map((header) => (
-                              <th className="px-4 py-3 text-[12px] font-bold uppercase text-crimson-700" key={header}>{header}</th>
+                              <th
+                                className="px-4 py-3 text-[12px] font-bold uppercase text-crimson-700"
+                                key={header}
+                              >
+                                {header}
+                              </th>
                             ))}
                           </tr>
                         </thead>
                         <tbody>
-                          {match.status_note ? (
-                            <tr>
-                              <td className="px-4 py-3 text-[13px] text-[#77777a]">{formatDate(match.updated_at ?? match.created_at)}</td>
-                              <td className="px-4 py-3"><Badge tone="green">{match.status ?? "Note"}</Badge></td>
-                              <td className="px-4 py-3 text-[13px] text-[#555b66]">{match.status_note}</td>
-                            </tr>
+                          {feedback.length > 0 ? (
+                            feedback.map((row, index) => (
+                              <tr key={`${row.action}-${row.date}-${index}`}>
+                                <td className="px-4 py-3 text-[13px] text-[#77777a]">
+                                  {formatDate(row.date)}
+                                </td>
+                                <td className="px-4 py-3">
+                                  <Badge tone={reviewStatusTone(row.action)}>{row.action}</Badge>
+                                </td>
+                                <td className="px-4 py-3 text-[13px] text-[#555b66]">
+                                  {row.comments || "-"}
+                                </td>
+                              </tr>
+                            ))
                           ) : (
                             <tr>
-                              <td className="px-4 py-5 text-center text-[13px] text-[#9ca0a8]" colSpan={3}>No feedback recorded yet</td>
+                              <td
+                                className="px-4 py-5 text-center text-[13px] text-[#9ca0a8]"
+                                colSpan={3}
+                              >
+                                No feedback recorded yet
+                              </td>
                             </tr>
                           )}
                         </tbody>
@@ -224,13 +429,35 @@ export default function CandidateReviewPage() {
                   </div>
 
                   <div className="mt-5 flex flex-wrap gap-3">
-                    <Button leftIcon={<Save className="h-4 w-4" />} onClick={() => save(match)}>
+                    <Button
+                      disabled={actionState.moving}
+                      isLoading={actionState.saving}
+                      leftIcon={<Save className="h-4 w-4" />}
+                      onClick={() => save(match)}
+                    >
                       Save Status
                     </Button>
-                    <Button onClick={() => moveNext(match)} rightIcon={<ArrowRight className="h-4 w-4" />} variant="secondary">
+                    <Button
+                      disabled={actionState.saving}
+                      isLoading={actionState.moving}
+                      onClick={() => moveNext(match)}
+                      rightIcon={<ArrowRight className="h-4 w-4" />}
+                      variant="secondary"
+                    >
                       Move to Next Stage
                     </Button>
                   </div>
+                  {actionState.message ? (
+                    <p
+                      className={`mt-3 text-[13px] font-bold ${
+                        actionState.messageTone === "success"
+                          ? "text-[#04743b]"
+                          : "text-[#b91c1c]"
+                      }`}
+                    >
+                      {actionState.message}
+                    </p>
+                  ) : null}
                 </Card>
               );
             })}
@@ -250,21 +477,59 @@ export default function CandidateReviewPage() {
             <div className="mt-6 border-t border-[#E5E7EB] pt-5">
               <h3 className="mb-4 text-[17px] font-bold text-[#333438]">Quick Actions</h3>
               <div className="space-y-2">
-                <Button className="w-full" onClick={() => setToast("Coming soon")} variant="secondary">Export Report</Button>
-                <Button className="w-full" onClick={() => setToast("Coming soon")} variant="secondary">Send Reminders</Button>
+                <Button
+                  className="w-full"
+                  onClick={() => setToast("Coming soon")}
+                  variant="secondary"
+                >
+                  Export Report
+                </Button>
+                <Button
+                  className="w-full"
+                  onClick={() => setToast("Coming soon")}
+                  variant="secondary"
+                >
+                  Send Reminders
+                </Button>
                 {selectedJobId ? (
                   <Link href={`/matches/${encodeURIComponent(selectedJobId)}`}>
                     <Button className="mt-2 w-full">View Final Selection</Button>
                   </Link>
                 ) : null}
               </div>
-              {toast ? <p className="mt-3 text-center text-[13px] font-bold text-crimson-700">{toast}</p> : null}
+              {toast ? (
+                <p className="mt-3 text-center text-[13px] font-bold text-crimson-700">
+                  {toast}
+                </p>
+              ) : null}
             </div>
           </Card>
         </div>
       )}
     </>
   );
+}
+
+function reviewStatusTone(
+  status?: string,
+): "green" | "blue" | "indigo" | "purple" | "amber" | "red" | "grey" | "crimson" {
+  switch ((status ?? "Matched").toLowerCase()) {
+    case "matched":
+    case "interview sent":
+      return "blue";
+    case "approved":
+      return "indigo";
+    case "shortlisted":
+      return "purple";
+    case "interview completed":
+      return "green";
+    case "uplifted":
+      return "amber";
+    case "sent":
+      return "grey";
+    default:
+      return "grey";
+  }
 }
 
 function Avatar({ name }: { name: string }) {
@@ -285,12 +550,17 @@ function ProgressCard({
   value: number;
 }) {
   return (
-    <div className={`mb-4 rounded-[8px] border px-4 py-4 ${
-      tone === "green" ? "border-[#b7efc9] bg-[#effbf3] text-[#04743b]" :
-      tone === "red" ? "border-[#fecaca] bg-[#fff1f1] text-[#b91c1c]" :
-      tone === "amber" ? "border-[#fde68a] bg-[#fffbea] text-[#a65f00]" :
-      "border-[#E5E7EB] bg-white text-[#333438]"
-    }`}>
+    <div
+      className={`mb-4 rounded-[8px] border px-4 py-4 ${
+        tone === "green"
+          ? "border-[#b7efc9] bg-[#effbf3] text-[#04743b]"
+          : tone === "red"
+            ? "border-[#fecaca] bg-[#fff1f1] text-[#b91c1c]"
+            : tone === "amber"
+              ? "border-[#fde68a] bg-[#fffbea] text-[#a65f00]"
+              : "border-[#E5E7EB] bg-white text-[#333438]"
+      }`}
+    >
       <p className="text-[14px]">{label}</p>
       <p className="mt-3 text-[26px] font-bold">{value}</p>
     </div>
