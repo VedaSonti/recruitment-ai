@@ -9,8 +9,11 @@ import { Button } from "@/components/ui/Button";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { LoadingSpinner } from "@/components/ui/LoadingSpinner";
 import {
+  getInterviewByMatch,
   getJobs,
   getMatchesByJob,
+  isAPIError,
+  scheduleInterview,
   updateMatchStatus,
   type Job,
   type Match,
@@ -26,6 +29,7 @@ import {
 } from "@/src/lib/utils";
 
 type Disposition = "" | "Willing" | "Not Willing" | "No Show / Disappeared";
+type InterviewResult = Awaited<ReturnType<typeof getInterviewByMatch>>;
 
 type FeedbackRow = {
   action: string;
@@ -36,10 +40,14 @@ type FeedbackRow = {
 type RowActionState = Record<
   string,
   {
+    bannerMessage?: string;
+    bannerTone?: "success" | "error";
     message?: string;
     messageTone?: "success" | "error";
     moving?: boolean;
     saving?: boolean;
+    scheduling?: boolean;
+    viewingResults?: boolean;
   }
 >;
 
@@ -65,6 +73,10 @@ export default function CandidateReviewPage() {
   const [dispositions, setDispositions] = useState<Record<string, Disposition>>({});
   const [feedbackRows, setFeedbackRows] = useState<Record<string, FeedbackRow[]>>({});
   const [rowActions, setRowActions] = useState<RowActionState>({});
+  const [interviewResult, setInterviewResult] = useState<InterviewResult | null>(null);
+  const [showInterviewModal, setShowInterviewModal] = useState(false);
+  const [activeInterviewMatchId, setActiveInterviewMatchId] = useState("");
+  const [modalActionLoading, setModalActionLoading] = useState<"uplift" | "reject" | null>(null);
   const [toast, setToast] = useState("");
   const [isLoading, setIsLoading] = useState(true);
 
@@ -151,6 +163,13 @@ export default function CandidateReviewPage() {
         ...update,
       },
     }));
+  }
+
+  function clearRowBanner(matchId: string) {
+    setRowLoading(matchId, {
+      bannerMessage: undefined,
+      bannerTone: undefined,
+    });
   }
 
   function showRowMessage(
@@ -266,6 +285,95 @@ export default function CandidateReviewPage() {
     }
   }
 
+  async function schedule(match: Match) {
+    const id = getMatchId(match);
+
+    if (!id) {
+      return;
+    }
+
+    setRowLoading(id, {
+      bannerMessage: undefined,
+      bannerTone: undefined,
+      scheduling: true,
+    });
+
+    try {
+      const result = await scheduleInterview(id);
+      patchMatch(id, {
+        status: "Interview Sent",
+        updated_at: new Date().toISOString(),
+      });
+      setRowLoading(id, {
+        bannerMessage: `\u2713 Interview invitation sent to ${result.candidate_email}`,
+        bannerTone: "success",
+        scheduling: false,
+      });
+    } catch (error) {
+      const message =
+        isAPIError(error) && error.status === 400
+          ? "Cannot schedule \u2014 no email address on file for this candidate."
+          : error instanceof Error
+            ? error.message
+            : "Failed to schedule interview.";
+
+      setRowLoading(id, {
+        bannerMessage: message,
+        bannerTone: "error",
+        scheduling: false,
+      });
+    }
+  }
+
+  async function viewInterviewResults(match: Match) {
+    const id = getMatchId(match);
+
+    if (!id) {
+      return;
+    }
+
+    setRowLoading(id, {
+      bannerMessage: undefined,
+      bannerTone: undefined,
+      viewingResults: true,
+    });
+
+    try {
+      const result = await getInterviewByMatch(id);
+      setInterviewResult(result);
+      setActiveInterviewMatchId(id);
+      setShowInterviewModal(true);
+      setRowLoading(id, { viewingResults: false });
+    } catch (error) {
+      setRowLoading(id, {
+        bannerMessage: error instanceof Error ? error.message : "Failed to load interview results.",
+        bannerTone: "error",
+        viewingResults: false,
+      });
+    }
+  }
+
+  async function completeFromModal(status: "Uplifted" | "Sent") {
+    if (!activeInterviewMatchId) {
+      return;
+    }
+
+    setModalActionLoading(status === "Uplifted" ? "uplift" : "reject");
+
+    try {
+      await updateMatchStatus(activeInterviewMatchId, status);
+      patchMatch(activeInterviewMatchId, {
+        status,
+        updated_at: new Date().toISOString(),
+      });
+      setShowInterviewModal(false);
+      setInterviewResult(null);
+      setActiveInterviewMatchId("");
+    } finally {
+      setModalActionLoading(null);
+    }
+  }
+
   return (
     <>
       <PageHeader
@@ -301,6 +409,7 @@ export default function CandidateReviewPage() {
               const id = getMatchId(match);
               const selected = dispositions[id] ?? "";
               const actionState = rowActions[id] ?? {};
+              const status = match.status ?? "Matched";
               const feedback = feedbackRows[id]?.length
                 ? feedbackRows[id]
                 : match.status_note
@@ -325,6 +434,41 @@ export default function CandidateReviewPage() {
                         <p className="mt-2 text-[14px] text-[#77777a]">
                           Match Score: <Badge tone="green">{scoreToPercent(match.score)}%</Badge>
                         </p>
+                        <div className="mt-3 flex flex-wrap items-center gap-3 text-[14px] text-[#77777a]">
+                          <span>
+                            Status: <Badge tone={reviewStatusTone(status)}>{status}</Badge>
+                          </span>
+                          {status === "Shortlisted" ? (
+                            <Button
+                              className="border-crimson-700 text-crimson-700 hover:bg-[#fff5f7]"
+                              isLoading={actionState.scheduling}
+                              onClick={() => schedule(match)}
+                              size="sm"
+                              variant="secondary"
+                            >
+                              Schedule AI Interview
+                            </Button>
+                          ) : null}
+                          {status === "Interview Sent" ? (
+                            <Badge className="bg-[#edf0f4] text-[#667085]" tone="grey">
+                              Interview Invited
+                            </Badge>
+                          ) : null}
+                          {status === "Interview Completed" ? (
+                            <>
+                              <Badge tone="green">Interview Completed {"\u2713"}</Badge>
+                              <button
+                                className="inline-flex items-center gap-2 text-[14px] font-bold text-crimson-700 disabled:opacity-60"
+                                disabled={actionState.viewingResults}
+                                onClick={() => viewInterviewResults(match)}
+                                type="button"
+                              >
+                                {actionState.viewingResults ? <LoadingSpinner size="sm" /> : null}
+                                View Results {"\u2192"}
+                              </button>
+                            </>
+                          ) : null}
+                        </div>
                       </div>
                     </div>
                     {match.candidate_id ? (
@@ -336,6 +480,28 @@ export default function CandidateReviewPage() {
                       </Link>
                     ) : null}
                   </div>
+
+                  {actionState.bannerMessage ? (
+                    <div
+                      className={`mb-5 flex items-start justify-between gap-3 rounded-[8px] border px-4 py-3 text-[13px] font-bold ${
+                        actionState.bannerTone === "success"
+                          ? "border-[#b7efc9] bg-[#effbf3] text-[#04743b]"
+                          : "border-[#fecaca] bg-[#fff1f1] text-[#b91c1c]"
+                      }`}
+                    >
+                      <span>{actionState.bannerMessage}</span>
+                      {actionState.bannerTone === "success" ? (
+                        <button
+                          aria-label="Dismiss interview invitation message"
+                          className="text-[18px] leading-none"
+                          onClick={() => clearRowBanner(id)}
+                          type="button"
+                        >
+                          {"\u00d7"}
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
 
                   <div className="grid gap-4 md:grid-cols-2">
                     <label>
@@ -506,7 +672,131 @@ export default function CandidateReviewPage() {
           </Card>
         </div>
       )}
+
+      {showInterviewModal && interviewResult ? (
+        <InterviewResultsModal
+          isSaving={modalActionLoading}
+          onClose={() => setShowInterviewModal(false)}
+          onProceed={() => completeFromModal("Uplifted")}
+          onReject={() => completeFromModal("Sent")}
+          result={interviewResult}
+        />
+      ) : null}
     </>
+  );
+}
+
+function InterviewResultsModal({
+  isSaving,
+  onClose,
+  onProceed,
+  onReject,
+  result,
+}: {
+  isSaving: "uplift" | "reject" | null;
+  onClose: () => void;
+  onProceed: () => void;
+  onReject: () => void;
+  result: InterviewResult;
+}) {
+  const assessment = result.assessment;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6">
+      <div className="relative max-h-[88vh] w-full max-w-[920px] overflow-y-auto rounded-[8px] bg-white p-7 shadow-2xl">
+        <button
+          aria-label="Close interview results"
+          className="absolute right-5 top-4 text-[28px] leading-none text-[#77777a] hover:text-[#333438]"
+          onClick={onClose}
+          type="button"
+        >
+          {"\u00d7"}
+        </button>
+
+        <div className="pr-10">
+          <p className="text-[12px] font-bold uppercase tracking-[0.14em] text-crimson-700">
+            Interview Results
+          </p>
+          <h2 className="mt-2 text-[26px] font-bold text-[#333438]">{result.candidate_name}</h2>
+          <p className="mt-1 text-[15px] text-[#77777a]">{result.job_title}</p>
+        </div>
+
+        {assessment ? (
+          <div className="mt-6 space-y-6">
+            <div className="rounded-[8px] border border-[#E5E7EB] bg-[#f9fafb] p-5">
+              <p className="text-[13px] font-bold uppercase text-[#77777a]">Overall Score</p>
+              <p className={`mt-2 text-[44px] font-bold ${scoreTextColor(assessment.overall_interview_score)}`}>
+                {assessment.overall_interview_score}/100
+              </p>
+              <p className="mt-3 text-[15px] leading-7 text-[#555b66]">{assessment.summary}</p>
+            </div>
+
+            <section>
+              <h3 className="mb-3 text-[18px] font-bold text-[#333438]">Q&A Transcript</h3>
+              <div className="space-y-4">
+                {result.responses.map((response) => {
+                  const answerAssessment = assessment.answer_assessments.find(
+                    (item) => item.question_index === response.question_index,
+                  );
+
+                  return (
+                    <div className="relative rounded-[8px] border border-[#E5E7EB] p-4" key={`${response.question_index}-${response.submitted_at}`}>
+                      {answerAssessment ? (
+                        <Badge className="absolute right-4 top-4" tone={scoreTone(answerAssessment.score)}>
+                          {answerAssessment.score}/100
+                        </Badge>
+                      ) : null}
+                      <div className="rounded-[8px] bg-[#f3f4f6] p-3 pr-24 text-[14px] font-bold text-[#333438]">
+                        {response.question}
+                      </div>
+                      <p className="mt-3 text-[14px] leading-6 text-[#555b66]">{response.transcript}</p>
+                      {answerAssessment?.comment ? (
+                        <p className="mt-3 text-[13px] italic text-[#77777a]">{answerAssessment.comment}</p>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+
+            <div className="grid gap-5 md:grid-cols-2">
+              <ResultList title="Key Observations" items={assessment.key_observations} />
+              <ResultList title="Areas to Probe" items={assessment.areas_to_probe} />
+            </div>
+          </div>
+        ) : (
+          <div className="mt-6 rounded-[8px] border border-[#E5E7EB] bg-[#f9fafb] p-8 text-center text-[15px] text-[#77777a]">
+            Assessment is being processed...
+          </div>
+        )}
+
+        <div className="mt-7 flex flex-wrap justify-end gap-3 border-t border-[#E5E7EB] pt-5">
+          <Button isLoading={isSaving === "uplift"} onClick={onProceed}>
+            Proceed to Next Stage
+          </Button>
+          <Button isLoading={isSaving === "reject"} onClick={onReject} variant="danger">
+            Reject
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ResultList({ items, title }: { items: string[]; title: string }) {
+  return (
+    <section className="rounded-[8px] border border-[#E5E7EB] p-4">
+      <h3 className="mb-3 text-[16px] font-bold text-[#333438]">{title}</h3>
+      {items.length > 0 ? (
+        <ul className="space-y-2 text-[14px] leading-6 text-[#555b66]">
+          {items.map((item) => (
+            <li key={item}>• {item}</li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-[14px] text-[#9ca0a8]">No items recorded.</p>
+      )}
+    </section>
   );
 }
 
@@ -530,6 +820,30 @@ function reviewStatusTone(
     default:
       return "grey";
   }
+}
+
+function scoreTone(score: number): "green" | "amber" | "red" {
+  if (score >= 80) {
+    return "green";
+  }
+
+  if (score >= 60) {
+    return "amber";
+  }
+
+  return "red";
+}
+
+function scoreTextColor(score: number) {
+  if (score >= 80) {
+    return "text-[#00a64f]";
+  }
+
+  if (score >= 60) {
+    return "text-[#d18b00]";
+  }
+
+  return "text-[#dc2626]";
 }
 
 function Avatar({ name }: { name: string }) {
