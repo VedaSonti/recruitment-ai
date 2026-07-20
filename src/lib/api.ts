@@ -421,3 +421,49 @@ export async function getSkillAnalysis(
     method: "GET",
   });
 }
+
+export async function scheduleInterview(matchId: string): Promise<{
+  message: string;
+  token: string;
+  interview_url: string;
+  candidate_email: string;
+  expires_at: string;
+  email_sent: boolean;
+}> {
+  return request(`/interviews/schedule/${encodeURIComponent(matchId)}`, {
+    method: "POST",
+  });
+}
+
+export async function getInterviewByMatch(matchId: string): Promise<{
+  interview_id: string;
+  candidate_name: string;
+  candidate_email: string;
+  job_title: string;
+  status: string;
+  questions: string[];
+  responses: Array<{
+    question_index: number;
+    question: string;
+    transcript: string;
+    submitted_at: string;
+  }>;
+  assessment: {
+    overall_interview_score: number;
+    summary: string;
+    answer_assessments: Array<{
+      question_index: number;
+      question: string;
+      score: number;
+      comment: string;
+    }>;
+    key_observations: string[];
+    areas_to_probe: string[];
+  } | null;
+  expires_at: string;
+  created_at: string;
+}> {
+  return request(`/interviews/by-match/${encodeURIComponent(matchId)}`, {
+    method: "GET",
+  });
+}
