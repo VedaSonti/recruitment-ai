@@ -728,8 +728,23 @@ async def submit_response(token: str, audio: UploadFile = File(...)):
     )
 
     if all_done:
-        return {"completed": True, "message": "All questions answered. Thank you!",
-                "next_question": None, "next_question_index": None}
+        # Update match status immediately so recruiter portal shows results
+        # Don't wait for assessment - transcript is available right now
+        interview_doc = await interviews_collection.find_one({"token": token})
+        if interview_doc and interview_doc.get("match_id"):
+            await matches_collection.update_one(
+                {"_id": interview_doc["match_id"]},
+                {"$set": {
+                    "status": "Interview Completed",
+                    "updated_at": datetime.now(timezone.utc),
+                }}
+            )
+        return {
+            "completed": True,
+            "message": "All questions answered. Thank you!",
+            "next_question": None,
+            "next_question_index": None,
+        }
     return {
         "completed": False,
         "transcript_received": transcript[:100] + ("..." if len(transcript) > 100 else ""),

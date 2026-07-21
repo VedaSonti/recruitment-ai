@@ -172,6 +172,26 @@ export default function CandidateReviewPage() {
     }
   }
 
+  async function refreshMatchStatus(matchId: string) {
+    if (!selectedJobId) {
+      return;
+    }
+
+    try {
+      const fresh = await getMatchesByJob(selectedJobId);
+      setMatches((current) =>
+        current.map((match) => {
+          const updated = fresh.find((item) => getMatchId(item) === getMatchId(match));
+          return updated && getMatchId(match) === matchId
+            ? ({ ...match, status: updated.status, updated_at: updated.updated_at } as Match)
+            : match;
+        }),
+      );
+    } catch {
+      // Silent fail: this is a lightweight status check.
+    }
+  }
+
   async function closeInterviewModal() {
     setShowInterviewModal(false);
     setInterviewResult(null);
@@ -485,7 +505,8 @@ export default function CandidateReviewPage() {
               const status = match.status ?? "Matched";
               const selected = dispositions[id] ?? (status === "Shortlisted" ? "Willing" : "");
               const lockedWilling = status === "Shortlisted" && !unlockedDispositions[id];
-              const canViewInterviewResults = ["Interview Completed", "Assessed", "Uplifted"].includes(status);
+              const interviewDone = ["Interview Completed", "Assessed", "Uplifted", "Sent"].includes(status);
+              const canCheckInterviewResults = status === "Interview Sent";
               const feedback = feedbackRows[id]?.length
                 ? feedbackRows[id]
                 : match.status_note
@@ -526,13 +547,22 @@ export default function CandidateReviewPage() {
                             </Button>
                           ) : null}
                           {status === "Interview Sent" ? (
-                            <Badge className="bg-[#edf0f4] text-[#667085]" tone="grey">
-                              Interview Invited
-                            </Badge>
-                          ) : null}
-                          {canViewInterviewResults ? (
                             <>
-                              <Badge tone={reviewStatusTone(status)}>{status} {"\u2713"}</Badge>
+                              <Badge className="bg-[#edf0f4] text-[#667085]" tone="grey">
+                                Interview Invited
+                              </Badge>
+                              <button
+                                className="flex items-center gap-1 text-[12px] text-gray-400 hover:text-gray-600"
+                                onClick={() => refreshMatchStatus(id)}
+                                type="button"
+                              >
+                                {"\u21bb"} Refresh status
+                              </button>
+                            </>
+                          ) : null}
+                          {interviewDone || canCheckInterviewResults ? (
+                            <>
+                              {interviewDone ? <Badge tone={reviewStatusTone(status)}>{status} {"\u2713"}</Badge> : null}
                               <button
                                 className="inline-flex items-center gap-2 text-[14px] font-bold text-crimson-700 disabled:opacity-60"
                                 disabled={actionState.viewingResults}
@@ -540,7 +570,7 @@ export default function CandidateReviewPage() {
                                 type="button"
                               >
                                 {actionState.viewingResults ? <LoadingSpinner size="sm" /> : null}
-                                View Results {"\u2192"}
+                                {canCheckInterviewResults ? "Check for Results" : "View Results"} {"\u2192"}
                               </button>
                             </>
                           ) : null}
@@ -875,7 +905,14 @@ function InterviewResultsModal({
 
           {!assessment ? (
             <div className="rounded-[8px] border border-[#f7d06b] bg-[#fffbeb] p-4 text-[14px] font-bold text-[#a65f00]">
-              Assessment is being processed...
+              AI scoring is being processed. Raw transcript is shown above.
+              <button
+                className="ml-2 underline hover:text-[#7c4a00]"
+                onClick={onRefresh}
+                type="button"
+              >
+                Refresh to check scores
+              </button>
             </div>
           ) : (
             <div className="grid gap-5 md:grid-cols-2">
