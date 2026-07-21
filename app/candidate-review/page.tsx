@@ -51,8 +51,8 @@ type RowActionState = Record<
   }
 >;
 
-const statusMap: Record<Exclude<Disposition, "">, "Approved" | "Sent" | "Matched"> = {
-  Willing: "Approved",
+const statusMap: Record<Exclude<Disposition, "">, "Shortlisted" | "Sent" | "Matched"> = {
+  Willing: "Shortlisted",
   "Not Willing": "Sent",
   "No Show / Disappeared": "Matched",
 };
@@ -71,12 +71,14 @@ export default function CandidateReviewPage() {
   const [matches, setMatches] = useState<Match[]>([]);
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [dispositions, setDispositions] = useState<Record<string, Disposition>>({});
+  const [unlockedDispositions, setUnlockedDispositions] = useState<Record<string, boolean>>({});
   const [feedbackRows, setFeedbackRows] = useState<Record<string, FeedbackRow[]>>({});
   const [rowActions, setRowActions] = useState<RowActionState>({});
   const [interviewResult, setInterviewResult] = useState<InterviewResult | null>(null);
   const [showInterviewModal, setShowInterviewModal] = useState(false);
   const [activeInterviewMatchId, setActiveInterviewMatchId] = useState("");
   const [modalActionLoading, setModalActionLoading] = useState<"uplift" | "reject" | null>(null);
+  const [isRefreshingInterview, setIsRefreshingInterview] = useState(false);
   const [toast, setToast] = useState("");
   const [isLoading, setIsLoading] = useState(true);
 
@@ -107,6 +109,7 @@ export default function CandidateReviewPage() {
         setMatches([]);
         setFeedbackRows({});
         setRowActions({});
+        setUnlockedDispositions({});
         setIsLoading(false);
         return;
       }
@@ -117,6 +120,7 @@ export default function CandidateReviewPage() {
         setMatches(nextMatches);
         setFeedbackRows({});
         setRowActions({});
+        setUnlockedDispositions({});
         setIsLoading(false);
       }
     }
@@ -153,6 +157,26 @@ export default function CandidateReviewPage() {
         getMatchId(match) === matchId ? ({ ...match, ...update } as Match) : match,
       ),
     );
+  }
+
+  async function refreshMatchesForCurrentJob() {
+    if (!selectedJobId) {
+      return;
+    }
+
+    try {
+      const nextMatches = await getMatchesByJob(selectedJobId);
+      setMatches(nextMatches);
+    } catch {
+      // Keep the current card state if the background refresh fails.
+    }
+  }
+
+  async function closeInterviewModal() {
+    setShowInterviewModal(false);
+    setInterviewResult(null);
+    setActiveInterviewMatchId("");
+    await refreshMatchesForCurrentJob();
   }
 
   function setRowLoading(matchId: string, update: Partial<RowActionState[string]>) {
@@ -226,6 +250,9 @@ export default function CandidateReviewPage() {
         status_note: note,
         updated_at: now,
       });
+      if (status === "Shortlisted") {
+        setUnlockedDispositions((current) => ({ ...current, [id]: false }));
+      }
       setFeedbackRows((current) => ({
         ...current,
         [id]: [
@@ -253,6 +280,44 @@ export default function CandidateReviewPage() {
     }
 
     const currentStatus = (match.status ?? "Matched") as MatchStatus;
+
+    setRowLoading(id, {
+      bannerMessage: undefined,
+      bannerTone: undefined,
+      message: undefined,
+      messageTone: undefined,
+      moving: true,
+    });
+
+    if (currentStatus === "Shortlisted") {
+      try {
+        const result = await scheduleInterview(id);
+        patchMatch(id, {
+          status: "Interview Sent",
+          updated_at: new Date().toISOString(),
+        });
+        setRowLoading(id, {
+          bannerMessage: `\u2713 Interview invitation sent to ${result.candidate_email}`,
+          bannerTone: "success",
+          moving: false,
+        });
+      } catch (error) {
+        const message =
+          isAPIError(error) && error.status === 400
+            ? "Cannot schedule \u2014 no email address on file for this candidate."
+            : error instanceof Error
+              ? error.message
+              : "Failed to schedule interview.";
+
+        setRowLoading(id, {
+          bannerMessage: message,
+          bannerTone: "error",
+          moving: false,
+        });
+      }
+      return;
+    }
+
     const nextStatus: MatchStatus | null =
       currentStatus === "Approved"
         ? "Shortlisted"
@@ -261,15 +326,10 @@ export default function CandidateReviewPage() {
           : null;
 
     if (!nextStatus) {
-      showRowMessage(id, "Candidate must be Matched or Approved before moving", "error");
+      setRowLoading(id, { moving: false });
+      showRowMessage(id, "Candidate must be Matched, Approved, or Shortlisted before moving", "error");
       return;
     }
-
-    setRowLoading(id, {
-      message: undefined,
-      messageTone: undefined,
-      moving: true,
-    });
 
     try {
       await updateMatchStatus(id, nextStatus);
@@ -353,6 +413,22 @@ export default function CandidateReviewPage() {
     }
   }
 
+  async function refreshInterviewResults() {
+    if (!activeInterviewMatchId) {
+      return;
+    }
+
+    setIsRefreshingInterview(true);
+
+    try {
+      const result = await getInterviewByMatch(activeInterviewMatchId);
+      setInterviewResult(result);
+      await refreshMatchesForCurrentJob();
+    } finally {
+      setIsRefreshingInterview(false);
+    }
+  }
+
   async function completeFromModal(status: "Uplifted" | "Sent") {
     if (!activeInterviewMatchId) {
       return;
@@ -366,9 +442,7 @@ export default function CandidateReviewPage() {
         status,
         updated_at: new Date().toISOString(),
       });
-      setShowInterviewModal(false);
-      setInterviewResult(null);
-      setActiveInterviewMatchId("");
+      await closeInterviewModal();
     } finally {
       setModalActionLoading(null);
     }
@@ -407,9 +481,11 @@ export default function CandidateReviewPage() {
           <div className="space-y-5">
             {matches.map((match) => {
               const id = getMatchId(match);
-              const selected = dispositions[id] ?? "";
               const actionState = rowActions[id] ?? {};
               const status = match.status ?? "Matched";
+              const selected = dispositions[id] ?? (status === "Shortlisted" ? "Willing" : "");
+              const lockedWilling = status === "Shortlisted" && !unlockedDispositions[id];
+              const canViewInterviewResults = ["Interview Completed", "Assessed", "Uplifted"].includes(status);
               const feedback = feedbackRows[id]?.length
                 ? feedbackRows[id]
                 : match.status_note
@@ -454,9 +530,9 @@ export default function CandidateReviewPage() {
                               Interview Invited
                             </Badge>
                           ) : null}
-                          {status === "Interview Completed" ? (
+                          {canViewInterviewResults ? (
                             <>
-                              <Badge tone="green">Interview Completed {"\u2713"}</Badge>
+                              <Badge tone={reviewStatusTone(status)}>{status} {"\u2713"}</Badge>
                               <button
                                 className="inline-flex items-center gap-2 text-[14px] font-bold text-crimson-700 disabled:opacity-60"
                                 disabled={actionState.viewingResults}
@@ -504,27 +580,48 @@ export default function CandidateReviewPage() {
                   ) : null}
 
                   <div className="grid gap-4 md:grid-cols-2">
-                    <label>
-                      <span className="mb-2 block text-[14px] font-bold text-[#333438]">
-                        Disposition Status *
-                      </span>
-                      <select
-                        className="h-11 w-full rounded-[8px] border border-[#d8dee7] bg-white px-4 text-[15px]"
-                        onChange={(event) =>
-                          setDispositions((current) => ({
-                            ...current,
-                            [id]: event.target.value as Disposition,
-                          }))
-                        }
-                        value={selected}
-                      >
-                        <option value="">Select Status</option>
-                        <option>Willing</option>
-                        <option>Not Willing</option>
-                        <option>No Show / Disappeared</option>
-                      </select>
-                    </label>
-                    {selected === "Willing" ? (
+                    {lockedWilling ? (
+                      <div>
+                        <span className="mb-2 block text-[14px] font-bold text-[#333438]">
+                          Disposition Status *
+                        </span>
+                        <div className="flex h-11 items-center gap-3">
+                          <span className="inline-flex h-11 items-center gap-2 rounded-[8px] bg-[#d9f8e5] px-4 text-[14px] font-bold text-[#04743b]">
+                            <CheckCircle2 className="h-4 w-4" />
+                            Willing {"\u2014"} Shortlisted
+                          </span>
+                          <button
+                            className="text-[13px] font-bold text-[#77777a] hover:text-crimson-700"
+                            onClick={() => setUnlockedDispositions((current) => ({ ...current, [id]: true }))}
+                            type="button"
+                          >
+                            Change
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <label>
+                        <span className="mb-2 block text-[14px] font-bold text-[#333438]">
+                          Disposition Status *
+                        </span>
+                        <select
+                          className="h-11 w-full rounded-[8px] border border-[#d8dee7] bg-white px-4 text-[15px]"
+                          onChange={(event) =>
+                            setDispositions((current) => ({
+                              ...current,
+                              [id]: event.target.value as Disposition,
+                            }))
+                          }
+                          value={selected}
+                        >
+                          <option value="">Select Status</option>
+                          <option>Willing</option>
+                          <option>Not Willing</option>
+                          <option>No Show / Disappeared</option>
+                        </select>
+                      </label>
+                    )}
+                    {selected === "Willing" && !lockedWilling ? (
                       <div className="mt-7 flex h-11 items-center justify-center gap-2 rounded-[8px] bg-[#d9f8e5] text-[14px] font-bold text-[#04743b]">
                         <CheckCircle2 className="h-4 w-4" />
                         Willing to Proceed
@@ -675,9 +772,11 @@ export default function CandidateReviewPage() {
 
       {showInterviewModal && interviewResult ? (
         <InterviewResultsModal
+          isRefreshing={isRefreshingInterview}
           isSaving={modalActionLoading}
-          onClose={() => setShowInterviewModal(false)}
+          onClose={closeInterviewModal}
           onProceed={() => completeFromModal("Uplifted")}
+          onRefresh={refreshInterviewResults}
           onReject={() => completeFromModal("Sent")}
           result={interviewResult}
         />
@@ -687,19 +786,24 @@ export default function CandidateReviewPage() {
 }
 
 function InterviewResultsModal({
+  isRefreshing,
   isSaving,
   onClose,
   onProceed,
+  onRefresh,
   onReject,
   result,
 }: {
+  isRefreshing: boolean;
   isSaving: "uplift" | "reject" | null;
   onClose: () => void;
   onProceed: () => void;
+  onRefresh: () => void;
   onReject: () => void;
   result: InterviewResult;
 }) {
   const assessment = result.assessment;
+  const responses = result.responses ?? [];
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6">
@@ -721,8 +825,8 @@ function InterviewResultsModal({
           <p className="mt-1 text-[15px] text-[#77777a]">{result.job_title}</p>
         </div>
 
-        {assessment ? (
-          <div className="mt-6 space-y-6">
+        <div className="mt-6 space-y-6">
+          {assessment ? (
             <div className="rounded-[8px] border border-[#E5E7EB] bg-[#f9fafb] p-5">
               <p className="text-[13px] font-bold uppercase text-[#77777a]">Overall Score</p>
               <p className={`mt-2 text-[44px] font-bold ${scoreTextColor(assessment.overall_interview_score)}`}>
@@ -730,17 +834,22 @@ function InterviewResultsModal({
               </p>
               <p className="mt-3 text-[15px] leading-7 text-[#555b66]">{assessment.summary}</p>
             </div>
+          ) : null}
 
-            <section>
-              <h3 className="mb-3 text-[18px] font-bold text-[#333438]">Q&A Transcript</h3>
+          <section>
+            <h3 className="mb-3 text-[18px] font-bold text-[#333438]">Q&A Transcript</h3>
+            {responses.length > 0 ? (
               <div className="space-y-4">
-                {result.responses.map((response) => {
-                  const answerAssessment = assessment.answer_assessments.find(
+                {responses.map((response) => {
+                  const answerAssessment = assessment?.answer_assessments.find(
                     (item) => item.question_index === response.question_index,
                   );
 
                   return (
-                    <div className="relative rounded-[8px] border border-[#E5E7EB] p-4" key={`${response.question_index}-${response.submitted_at}`}>
+                    <div
+                      className="relative rounded-[8px] border border-[#E5E7EB] p-4"
+                      key={`${response.question_index}-${response.submitted_at}`}
+                    >
                       {answerAssessment ? (
                         <Badge className="absolute right-4 top-4" tone={scoreTone(answerAssessment.score)}>
                           {answerAssessment.score}/100
@@ -757,20 +866,35 @@ function InterviewResultsModal({
                   );
                 })}
               </div>
-            </section>
+            ) : (
+              <div className="rounded-[8px] border border-[#E5E7EB] bg-[#f9fafb] p-5 text-[14px] text-[#77777a]">
+                No interview responses recorded yet.
+              </div>
+            )}
+          </section>
 
-            <div className="grid gap-5 md:grid-cols-2">
-              <ResultList title="Key Observations" items={assessment.key_observations} />
-              <ResultList title="Areas to Probe" items={assessment.areas_to_probe} />
+          {!assessment ? (
+            <div className="rounded-[8px] border border-[#f7d06b] bg-[#fffbeb] p-4 text-[14px] font-bold text-[#a65f00]">
+              Assessment is being processed...
             </div>
-          </div>
-        ) : (
-          <div className="mt-6 rounded-[8px] border border-[#E5E7EB] bg-[#f9fafb] p-8 text-center text-[15px] text-[#77777a]">
-            Assessment is being processed...
-          </div>
-        )}
+          ) : (
+            <div className="grid gap-5 md:grid-cols-2">
+              <ResultList title="Key Observations" items={assessment.key_observations ?? []} />
+              <ResultList title="Areas to Probe" items={assessment.areas_to_probe ?? []} />
+            </div>
+          )}
+        </div>
 
-        <div className="mt-7 flex flex-wrap justify-end gap-3 border-t border-[#E5E7EB] pt-5">
+        <div className="mt-7 flex flex-wrap items-center justify-end gap-3 border-t border-[#E5E7EB] pt-5">
+          <Button
+            className="mr-auto border-[#d8dee7] text-[#555b66] hover:bg-[#f9fafb]"
+            isLoading={isRefreshing}
+            onClick={onRefresh}
+            size="sm"
+            variant="secondary"
+          >
+            {"\u21bb"} Refresh Results
+          </Button>
           <Button isLoading={isSaving === "uplift"} onClick={onProceed}>
             Proceed to Next Stage
           </Button>
@@ -812,6 +936,7 @@ function reviewStatusTone(
     case "shortlisted":
       return "purple";
     case "interview completed":
+    case "assessed":
       return "green";
     case "uplifted":
       return "amber";

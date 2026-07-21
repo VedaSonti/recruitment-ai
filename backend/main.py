@@ -484,30 +484,58 @@ async def schedule_interview(match_id: str):
     if not candidate.get("email"):
         raise HTTPException(400, "Candidate has no email address on file")
 
-    # Reuse interview questions from existing AI analysis if available
-    existing_analysis = match.get("analysis") or {}
-    questions = existing_analysis.get("interview_questions") or []
+    # Always generate fresh questions from the actual job description
+    # Never reuse cached questions — they may be from a different context
+    job_description = job.get("description_raw") or ""
+    job_title = job.get("title") or ""
+    job_skills = job.get("required_skills", [])
+    job_domain = job.get("domain") or "general"
+    cand_skills = candidate.get("skills", [])
+    cand_summary = candidate.get("summary") or ""
+    cand_years = candidate.get("years_experience") or 0
 
-    if not questions:
-        prompt = f"""Generate exactly 5 interview questions for this role.
-Job title: {job.get('title')}
-Required skills: {', '.join(job.get('required_skills', []))}
-Candidate summary: {candidate.get('summary', '')}
+    prompt = f"""You are a senior technical interviewer preparing questions for a candidate interview.
 
-Rules:
-- Questions must be specific to this role and the candidate's background
-- Mix of technical and behavioural questions
-- Each question should take 1-2 minutes to answer verbally
-- Do not ask yes/no questions
-- Return ONLY a JSON array of 5 strings, no other text
-Example: ["Question 1?", "Question 2?", "Question 3?", "Question 4?", "Question 5?"]"""
+JOB DETAILS:
+Title: {job_title}
+Domain: {job_domain}
+Required skills: {', '.join(job_skills)}
+Job description excerpt: {job_description[:1500]}
 
-        q_response = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5,
-        )
-        questions = json.loads(q_response.choices[0].message.content)
+CANDIDATE PROFILE:
+Summary: {cand_summary}
+Skills: {', '.join(cand_skills)}
+Years of experience: {cand_years}
+
+Generate exactly 5 interview questions that are:
+1. Directly relevant to THIS specific job description and required skills
+2. Tailored to this candidate's background (probe gaps, explore strengths)
+3. A mix of technical questions (testing specific required skills) and behavioural questions
+4. Open-ended — no yes/no questions
+5. Each answerable verbally in 1-3 minutes
+
+For technical questions, reference specific technologies from the required skills list.
+For behavioural questions, reference the job domain ({job_domain}) and expected responsibilities.
+
+Return ONLY a valid JSON array of exactly 5 question strings. No other text, no numbering, no markdown.
+Example format: ["Question one?", "Question two?", "Question three?", "Question four?", "Question five?"]"""
+
+    q_response = client.chat.completions.create(
+        model="gpt-4o",          # use stronger model for question quality
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.6,          # slight creativity for varied questions
+    )
+
+    raw = q_response.choices[0].message.content.strip()
+    # Strip markdown fences if GPT adds them
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    questions = json.loads(raw.strip())
+
+    if not isinstance(questions, list) or len(questions) == 0:
+        raise HTTPException(500, "Failed to generate interview questions")
 
     token = secrets.token_urlsafe(48)
     now = datetime.now(timezone.utc)

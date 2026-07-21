@@ -20,7 +20,7 @@ import {
 } from "@/src/lib/api";
 import { getJobId, getJobTitle, getMatchId, scoreToPercent } from "@/src/lib/utils";
 
-type RowAction = "approve" | "reject" | "shortlist";
+type RowAction = "reject" | "shortlist";
 type RowActionState = Record<
   string,
   {
@@ -42,6 +42,7 @@ export default function MatchResultsPage({
   const [isLoading, setIsLoading] = useState(true);
   const [isAnalysing, setIsAnalysing] = useState(false);
   const [actionState, setActionState] = useState<RowActionState>({});
+  const [statusOverrides, setStatusOverrides] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -59,6 +60,7 @@ export default function MatchResultsPage({
           setJobs(jobList);
           setMatches(matchList);
           setActionState({});
+          setStatusOverrides({});
         }
       } catch (requestError) {
         if (mounted) {
@@ -124,7 +126,7 @@ export default function MatchResultsPage({
 
   async function updateStatus(
     match: Match,
-    status: "Approved" | "Sent" | "Shortlisted",
+    status: "Sent" | "Shortlisted",
     action: RowAction,
   ) {
     const matchId = getMatchId(match);
@@ -139,6 +141,7 @@ export default function MatchResultsPage({
 
     try {
       await updateMatchStatus(matchId, status);
+      setStatusOverrides((current) => ({ ...current, [matchId]: status }));
       setMatches((current) =>
         current.map((item) =>
           getMatchId(item) === matchId ? ({ ...item, status } as Match) : item,
@@ -214,8 +217,9 @@ export default function MatchResultsPage({
             accented
             actionState={actionState}
             jobId={jobId}
+            statusOverrides={statusOverrides}
             matches={filtered.slice(0, 5)}
-            onApprove={(match) => updateStatus(match, "Approved", "approve")}
+            onShortlist={(match) => updateStatus(match, "Shortlisted", "shortlist")}
             onReject={(match) => updateStatus(match, "Sent", "reject")}
             title="Top 5 Recommended Candidates"
           />
@@ -223,8 +227,9 @@ export default function MatchResultsPage({
           <CandidateTable
             actionState={actionState}
             jobId={jobId}
+            statusOverrides={statusOverrides}
             matches={filtered.slice(5)}
-            onApprove={(match) => updateStatus(match, "Shortlisted", "shortlist")}
+            onShortlist={(match) => updateStatus(match, "Shortlisted", "shortlist")}
             onReject={(match) => updateStatus(match, "Sent", "reject")}
             title="Other Candidates"
           />
@@ -275,17 +280,19 @@ function CandidateTable({
   actionState,
   jobId,
   matches,
-  onApprove,
+  onShortlist,
   onReject,
   title,
+  statusOverrides,
 }: {
   accented?: boolean;
   actionState: RowActionState;
   jobId: string;
   matches: Match[];
-  onApprove: (match: Match) => void;
+  onShortlist: (match: Match) => void;
   onReject: (match: Match) => void;
   title: string;
+  statusOverrides: Record<string, string>;
 }) {
   return (
     <Card className="overflow-hidden">
@@ -317,16 +324,12 @@ function CandidateTable({
               const percent = scoreToPercent(match.score ?? match.match_score);
               const tech = match.analysis?.tech_match_percentage ?? Math.min(99, Math.round(percent * 1.02));
               const exp = match.analysis?.exp_match_percentage ?? Math.round(percent * 0.98);
-              const status = match.status ?? "Matched";
+              const status = statusOverrides[matchId] ?? match.status ?? "Matched";
               const rowState = actionState[matchId] ?? {};
               const isBusy = Boolean(rowState.loading);
-              const approveAction = accented ? "approve" : "shortlist";
-              const approveLabel = accented ? "Approve" : "Shortlist";
-              const approveDisabled =
-                isBusy ||
-                status === "Sent" ||
-                (accented ? status === "Approved" : status === "Shortlisted");
-              const rejectDisabled = isBusy || status === "Sent";
+              const completedStatus = ["Shortlisted", "Interview Sent", "Interview Completed", "Uplifted", "Sent"].includes(status);
+              const shortlistDisabled = isBusy || completedStatus;
+              const rejectDisabled = isBusy || completedStatus;
 
               return (
                 <tr className={index === 0 && accented ? "bg-[#fbf3f5]" : "bg-white"} key={matchId || `${match.candidate_id}-${index}`}>
@@ -355,11 +358,11 @@ function CandidateTable({
                         </Link>
                       ) : null}
                       <ActionLink
-                        disabled={approveDisabled}
-                        isLoading={rowState.loading === approveAction}
-                        onClick={() => onApprove(match)}
+                        disabled={shortlistDisabled}
+                        isLoading={rowState.loading === "shortlist"}
+                        onClick={() => onShortlist(match)}
                       >
-                        {approveLabel}
+                        Shortlist
                       </ActionLink>
                       <ActionLink
                         disabled={rejectDisabled}

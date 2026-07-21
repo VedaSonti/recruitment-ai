@@ -34,6 +34,7 @@ import {
   type DecisionAnalysis,
   type Job,
   type Match,
+  type MatchStatus,
   type SkillAnalysis,
 } from "@/src/lib/api";
 import {
@@ -61,6 +62,7 @@ export function CandidateDetail({
   const [isLoading, setIsLoading] = useState(true);
   const [isAnalysing, setIsAnalysing] = useState(false);
   const [skillLoading, setSkillLoading] = useState(false);
+  const [statusAction, setStatusAction] = useState<"shortlist" | "reject" | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -200,13 +202,27 @@ export function CandidateDetail({
     }
   }
 
-  async function setStatus(status: "Approved" | "Sent") {
+  async function setStatus(status: "Shortlisted" | "Sent") {
     if (!match) {
       return;
     }
-    await updateMatchStatus(getMatchId(match), status);
-    await refreshMatch();
+
+    setStatusAction(status === "Shortlisted" ? "shortlist" : "reject");
+
+    try {
+      await updateMatchStatus(getMatchId(match), status);
+      setMatch({
+        ...match,
+        status,
+        updated_at: new Date().toISOString(),
+      });
+    } finally {
+      setStatusAction(null);
+    }
   }
+
+  const currentStatus = (match?.status ?? "Matched") as MatchStatus | string;
+  const completedStatus = ["Shortlisted", "Interview Sent", "Interview Completed", "Uplifted", "Sent"].includes(currentStatus);
 
   const achievements = candidate?.key_achievements?.length
     ? candidate.key_achievements
@@ -246,12 +262,28 @@ export function CandidateDetail({
             {match ? <Badge tone="green">{scorePercent}% Match</Badge> : null}
           </div>
           <div className="flex items-center gap-2">
-            <Button disabled={!match} onClick={() => setStatus("Approved")} size="sm">
-              Approve
-            </Button>
-            <Button disabled={!match} onClick={() => setStatus("Sent")} size="sm" variant="secondary">
-              Reject
-            </Button>
+            {match ? <Badge tone={detailStatusTone(currentStatus)}>{currentStatus}</Badge> : null}
+            {match && !completedStatus ? (
+              <>
+                <Button
+                  disabled={Boolean(statusAction)}
+                  isLoading={statusAction === "shortlist"}
+                  onClick={() => setStatus("Shortlisted")}
+                  size="sm"
+                >
+                  Shortlist
+                </Button>
+                <Button
+                  disabled={Boolean(statusAction)}
+                  isLoading={statusAction === "reject"}
+                  onClick={() => setStatus("Sent")}
+                  size="sm"
+                  variant="secondary"
+                >
+                  Reject
+                </Button>
+              </>
+            ) : null}
             {jobId && match && !analysis ? (
               <Button isLoading={isAnalysing} onClick={runAnalysis} size="sm">
                 Run AI Analysis
@@ -393,18 +425,46 @@ export function CandidateDetail({
             </Card>
 
             <Card className="px-6 py-6">
-              <CardHeader className="mb-5" title="How This Score Was Calculated" />
+              <CardHeader className="mb-5" title="Score Details" />
               <div className="space-y-3 text-[14px]">
-                <ScoreRow label="Semantic Similarity" percent={50} value={scorePercent} />
-                <ScoreRow label="Skills Match" percent={30} value={skillsMatch} />
-                <ScoreRow label="Experience Match" percent={20} value={expMatch} />
+                <ScoreDetailRow
+                  explanation="How closely this candidate's overall profile aligns with the job description, based on Atlas Vector Search embeddings"
+                  label="Semantic Similarity Score"
+                  value={`${scorePercent}%`}
+                />
+                <ScoreDetailRow
+                  explanation="Percentage of required skills matched or transferable (semantic comparison)"
+                  label="Skills Coverage"
+                  tags={
+                    skillAnalysis ? (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <Badge tone="green">{skillAnalysis.matched.length} matched</Badge>
+                        <Badge tone="indigo">{skillAnalysis.partial.length} transferable</Badge>
+                        <Badge tone="amber">{skillAnalysis.missing.length} gaps</Badge>
+                      </div>
+                    ) : null
+                  }
+                  value={skillAnalysis ? `${skillAnalysis.semantic_skill_score}%` : "Run skill analysis"}
+                />
+                <ScoreDetailRow
+                  explanation="Candidate years of experience vs role requirement"
+                  label="Experience Coverage"
+                  value={analysis ? `${analysis.exp_match_percentage ?? "-"}%` : "Run AI Analysis"}
+                />
               </div>
+              <p className="mt-4 text-[13px] italic leading-6 text-[#77777a]">
+                The overall match score is based on semantic vector similarity. Skills and experience coverage are supplementary signals to help assess fit.
+              </p>
             </Card>
 
             <Card className="px-6 py-6">
               <CardHeader className="mb-5" title="Match Breakdown" />
               <div className="space-y-6">
-                <ProgressRow label="Skills Match" value={skillsMatch} />
+                <ProgressRow
+                  caption="Based on semantic skill similarity — not keyword matching"
+                  label="Skills Match"
+                  value={skillsMatch}
+                />
                 <ProgressRow label="Experience Match" value={expMatch} />
                 <ProgressRow label="Education Match" value={educationMatch} />
               </div>
@@ -484,6 +544,29 @@ export function CandidateDetail({
   );
 }
 
+
+function detailStatusTone(
+  status?: string,
+): "green" | "blue" | "indigo" | "purple" | "amber" | "red" | "grey" | "crimson" {
+  switch ((status ?? "Matched").toLowerCase()) {
+    case "matched":
+    case "interview sent":
+      return "blue";
+    case "approved":
+      return "indigo";
+    case "shortlisted":
+      return "purple";
+    case "interview completed":
+      return "green";
+    case "uplifted":
+      return "amber";
+    case "sent":
+      return "grey";
+    default:
+      return "grey";
+  }
+}
+
 function Avatar({ initials, size = "md" }: { initials: string; size?: "sm" | "md" }) {
   return (
     <span className={`flex shrink-0 items-center justify-center rounded-full bg-[#b70735] font-bold text-white ${size === "sm" ? "h-9 w-9 text-[14px]" : "h-14 w-14 text-[20px]"}`}>
@@ -552,23 +635,47 @@ function SemanticSkillSections({ analysis }: { analysis: SkillAnalysis }) {
   );
 }
 
-function ProgressRow({ label, value }: { label: string; value: number }) {
+function ProgressRow({
+  caption,
+  label,
+  value,
+}: {
+  caption?: string;
+  label: string;
+  value: number;
+}) {
   return (
     <div>
       <div className="mb-2 flex items-center justify-between text-[14px] font-bold text-[#333438]">
         <span>{label}</span><span>{value}%</span>
       </div>
       <ProgressBar value={value} />
+      {caption ? <p className="mt-2 text-[12px] text-[#77777a]">{caption}</p> : null}
     </div>
   );
 }
 
-function ScoreRow({ label, percent, value }: { label: string; percent: number; value: number }) {
+function ScoreDetailRow({
+  explanation,
+  label,
+  tags,
+  value,
+}: {
+  explanation: string;
+  label: string;
+  tags?: React.ReactNode;
+  value: string;
+}) {
   return (
-    <div className="grid grid-cols-[1fr_80px_90px] gap-3 rounded-[8px] border border-[#E5E7EB] px-4 py-3">
-      <span className="font-bold text-[#333438]">{label}</span>
-      <span className="text-[#77777a]">{percent}%</span>
-      <span className="text-right font-bold text-crimson-700">{Math.round((value * percent) / 100)} pts</span>
+    <div className="rounded-[8px] border border-[#E5E7EB] px-4 py-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="font-bold text-[#333438]">{label}</p>
+          <p className="mt-1 max-w-[420px] text-[12px] leading-5 text-[#77777a]">{explanation}</p>
+        </div>
+        <p className="text-right text-[16px] font-bold text-crimson-700">{value}</p>
+      </div>
+      {tags}
     </div>
   );
 }
