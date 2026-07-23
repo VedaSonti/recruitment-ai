@@ -15,6 +15,7 @@ import {
   getMatchesByJob,
   type Candidate,
   type Job,
+  type Match,
 } from "@/src/lib/api";
 import {
   formatDate,
@@ -29,6 +30,7 @@ type JobMeta = Record<string, { candidates: number; shortlisted: number }>;
 export default function DashboardPage() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [candidates, setCandidates] = useState<Candidate[]>([]);
+  const [matches, setMatches] = useState<Match[]>([]);
   const [jobMeta, setJobMeta] = useState<JobMeta>({});
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState("");
@@ -46,28 +48,32 @@ export default function DashboardPage() {
           getCandidates(),
         ]);
 
-        const metaPairs = await Promise.all(
-          jobList.slice(0, 8).map(async (job) => {
+        const matchPairs = await Promise.all(
+          jobList.map(async (job) => {
             const jobId = getJobId(job);
             if (!jobId) {
-              return [jobId, { candidates: 0, shortlisted: 0 }] as const;
+              return [jobId, [] as Match[]] as const;
             }
-            const matches = await getMatchesByJob(jobId);
-            return [
-              jobId,
-              {
-                candidates: matches.length,
-                shortlisted: matches.filter(
-                  (match) => match.status === "Shortlisted",
-                ).length,
-              },
-            ] as const;
+            return [jobId, await getMatchesByJob(jobId)] as const;
           }),
         );
+
+        const metaPairs = matchPairs.map(([jobId, jobMatches]) => [
+          jobId,
+          {
+            candidates: jobMatches.length,
+            shortlisted: jobMatches.filter(
+              (match) => match.status === "Shortlisted",
+            ).length,
+          },
+        ] as const);
+
+        const allMatches = matchPairs.flatMap(([, jobMatches]) => jobMatches);
 
         if (mounted) {
           setJobs(jobList);
           setCandidates(candidateList);
+          setMatches(allMatches);
           setJobMeta(Object.fromEntries(metaPairs));
         }
       } catch (requestError) {
@@ -93,14 +99,27 @@ export default function DashboardPage() {
   }, []);
 
   const activeJobs = jobs.filter((job) => (job.status ?? "Open") === "Open");
-  const awaitingReview = useMemo(
-    () => jobs.reduce((sum, job) => sum + (jobMeta[getJobId(job)]?.candidates ?? 0), 0),
-    [jobs, jobMeta],
-  );
-  const shortlisted = useMemo(
-    () => jobs.reduce((sum, job) => sum + (jobMeta[getJobId(job)]?.shortlisted ?? 0), 0),
-    [jobs, jobMeta],
-  );
+  const awaitingReview = useMemo(() => {
+    const awaitingCandidateIds = new Set(
+      matches
+        .filter((match) => match.status === "Matched")
+        .map((match) => match.candidate_id)
+        .filter(Boolean),
+    );
+    return awaitingCandidateIds.size;
+  }, [matches]);
+
+  const shortlisted = useMemo(() => {
+    const shortlistedIds = new Set(
+      matches
+        .filter((match) =>
+          ["Shortlisted", "Interview Sent", "Interview Completed"].includes(match.status ?? ""),
+        )
+        .map((match) => match.candidate_id)
+        .filter(Boolean),
+    );
+    return shortlistedIds.size;
+  }, [matches]);
 
   if (isLoading) {
     return (
