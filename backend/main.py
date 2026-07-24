@@ -18,9 +18,11 @@ This gives you an interactive page to test every endpoint without Postman.
 """
 
 import os
+import base64
 import json
 import hashlib
 import tempfile
+import io
 import smtplib
 import secrets
 from datetime import datetime, timezone, timedelta
@@ -30,6 +32,7 @@ from typing import Optional
 from bson import ObjectId
 
 import numpy as np
+from PIL import Image
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -750,6 +753,306 @@ async def submit_response(token: str, audio: UploadFile = File(...)):
         "transcript_received": transcript[:100] + ("..." if len(transcript) > 100 else ""),
         "next_question_index": question_index + 1,
         "next_question": interview["questions"][question_index + 1],
+    }
+
+
+@app.post("/interviews/{token}/respond-video")
+async def submit_video_response(token: str, video: UploadFile = File(...)):
+    """
+    Candidate submits video for one question.
+    Extracts audio track for Whisper transcription.
+    Stores video reference for later frame analysis.
+    """
+    interview = await interviews_collection.find_one({"token": token})
+    if not interview:
+        raise HTTPException(404, "Interview not found")
+    if interview["status"] == "Completed":
+        raise HTTPException(409, "Interview already completed")
+
+    now = datetime.now(timezone.utc)
+    if interview["expires_at"].replace(tzinfo=timezone.utc) < now:
+        raise HTTPException(410, "Interview link has expired")
+
+    question_index = len(interview.get("responses", []))
+    if question_index >= len(interview["questions"]):
+        raise HTTPException(400, "All questions already answered")
+
+    # Save video to temp file
+    suffix = ".webm"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await video.read())
+        tmp_path = tmp.name
+
+    try:
+        # Transcribe audio from the video file using Whisper
+        with open(tmp_path, "rb") as f:
+            transcription = client.audio.transcriptions.create(
+                model="whisper-1", file=f,
+            )
+        transcript = transcription.text
+
+        # Extract a key frame from the video for later vision analysis
+        # We store a base64 encoded frame snapshot per response
+        frame_b64 = extract_video_frame(tmp_path)
+
+    finally:
+        os.remove(tmp_path)
+
+    response_doc = {
+        "question_index": question_index,
+        "question": interview["questions"][question_index],
+        "transcript": transcript,
+        "frame_b64": frame_b64,   # stored for video analysis
+        "submitted_at": now.isoformat(),
+    }
+
+    new_responses = interview.get("responses", []) + [response_doc]
+    all_done = len(new_responses) >= len(interview["questions"])
+
+    await interviews_collection.update_one(
+        {"token": token},
+        {"$set": {
+            "responses": new_responses,
+            "status": "Completed" if all_done else "Started",
+        }}
+    )
+
+    if all_done:
+        interview_doc = await interviews_collection.find_one({"token": token})
+        if interview_doc and interview_doc.get("match_id"):
+            await matches_collection.update_one(
+                {"_id": interview_doc["match_id"]},
+                {"$set": {"status": "Interview Completed", "updated_at": now}}
+            )
+        return {"completed": True, "message": "All questions answered. Thank you!",
+                "next_question": None, "next_question_index": None}
+
+    return {
+        "completed": False,
+        "next_question_index": question_index + 1,
+        "next_question": interview["questions"][question_index + 1],
+    }
+
+
+def extract_video_frame(video_path: str) -> str | None:
+    """
+    Extract a single frame from a video file and return as base64.
+    Uses ffmpeg if available, otherwise returns None gracefully.
+    Frame is taken at 3 seconds in (after the candidate has settled).
+    """
+    try:
+        import subprocess
+        frame_path = video_path + "_frame.jpg"
+        result = subprocess.run([
+            "ffmpeg", "-i", video_path,
+            "-ss", "00:00:03",    # 3 seconds in
+            "-vframes", "1",
+            "-q:v", "2",
+            frame_path,
+            "-y", "-loglevel", "quiet"
+        ], capture_output=True, timeout=30)
+
+        if result.returncode == 0 and os.path.exists(frame_path):
+            with open(frame_path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
+            os.remove(frame_path)
+            return b64
+    except Exception as e:
+        print(f"[video] Frame extraction failed: {e}")
+    return None
+
+
+@app.post("/interviews/{token}/assess-video")
+async def assess_interview_with_video(token: str):
+    """
+    Full assessment including video analysis and CV consistency check.
+    Runs three GPT calls:
+    1. Standard answer quality assessment (same as assess_interview)
+    2. Video/presentation analysis using GPT-4o Vision on extracted frames
+    3. CV consistency check - does what they said match their CV claims?
+    """
+    interview = await interviews_collection.find_one({"token": token})
+    if not interview:
+        raise HTTPException(404, "Interview not found")
+    if interview["status"] not in ("Completed", "Assessed"):
+        raise HTTPException(400, "Interview not yet completed")
+
+    job = await jobs_collection.find_one({"_id": interview["job_id"]})
+    candidate = await candidates_collection.find_one({"_id": interview["candidate_id"]})
+    responses = interview.get("responses", [])
+
+    # --- GPT Call 1: Answer quality (same as assess_interview) ---
+    qa_text = "\n\n".join([
+        f"Q{i+1}: {r['question']}\nA: {r['transcript']}"
+        for i, r in enumerate(responses)
+    ])
+
+    quality_prompt = f"""You are an experienced recruitment interviewer reviewing a candidate's responses.
+
+Job: {interview['job_title']}
+Required skills: {', '.join((job or {}).get('required_skills', []))}
+Candidate: {interview['candidate_name']}
+
+Interview transcript:
+{qa_text}
+
+Assess the responses objectively. Do not make a hiring decision - present facts only.
+
+Return ONLY valid JSON:
+{{
+  "overall_interview_score": <0-100>,
+  "summary": "2-3 sentence factual summary",
+  "answer_assessments": [
+    {{"question_index": 0, "question": "...", "score": <0-100>, "comment": "one sentence"}}
+  ],
+  "key_observations": ["observation 1", "observation 2"],
+  "areas_to_probe": ["area 1", "area 2"]
+}}"""
+
+    quality_response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": quality_prompt}],
+        temperature=0.3,
+    )
+    assessment = json.loads(quality_response.choices[0].message.content)
+
+    # --- GPT Call 2: Video/presentation analysis ---
+    video_analysis = None
+    frames_available = [r for r in responses if r.get("frame_b64")]
+
+    if frames_available:
+        vision_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"""You are assessing a candidate's video interview presentation.
+Candidate: {interview['candidate_name']}
+Role: {interview['job_title']}
+
+The following images are frames captured during the candidate's interview responses.
+Assess their professional presentation objectively.
+
+Return ONLY valid JSON:
+{{
+  "confidence_score": <0-100>,
+  "eye_contact": "brief observation about eye contact",
+  "presentation": "brief observation about professional appearance and setting",
+  "body_language": "brief observation about posture and engagement",
+  "communication_clarity": "brief observation about how clearly they spoke",
+  "flags": ["any specific concern worth noting, or empty array if none"]
+}}
+
+Be factual and brief. Do not make character judgements."""
+                    }
+                ] + [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{r['frame_b64']}",
+                            "detail": "low"
+                        }
+                    }
+                    for r in frames_available[:3]
+                ]
+            }
+        ]
+
+        try:
+            vision_response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=vision_messages,
+                max_tokens=500,
+            )
+            video_analysis = json.loads(vision_response.choices[0].message.content)
+        except Exception as e:
+            print(f"[video analysis] Failed: {e}")
+            video_analysis = {"error": "Video analysis could not be completed"}
+
+    # --- GPT Call 3: CV consistency check ---
+    cv_raw = candidate.get("cv_raw", "") if candidate else ""
+    cand_skills = candidate.get("skills", []) if candidate else []
+    cand_years = candidate.get("years_experience", 0) if candidate else 0
+    cand_summary = candidate.get("summary", "") if candidate else ""
+
+    consistency_prompt = f"""You are checking whether a candidate's interview answers
+are consistent with their CV claims.
+
+CV SUMMARY: {cand_summary}
+CV SKILLS: {', '.join(cand_skills)}
+CV YEARS EXPERIENCE: {cand_years}
+CV EXCERPT (first 2000 chars): {cv_raw[:2000]}
+
+INTERVIEW TRANSCRIPT:
+{qa_text}
+
+Compare what the candidate said in the interview against what their CV claims.
+Look for:
+- Skills they claimed on CV but couldn't demonstrate knowledge of in the interview
+- Experience levels that seem inconsistent (CV says 5 years, answers suggest much less)
+- Specific projects or roles mentioned in CV that weren't mentioned or contradicted in interview
+- Positive consistency: CV claims they verified convincingly in their answers
+
+IMPORTANT: Be fair and balanced. A candidate may not mention everything from their CV
+in a short interview. Only flag genuine inconsistencies, not omissions.
+Do not accuse - present observations factually.
+
+Return ONLY valid JSON:
+{{
+  "overall_consistency_score": <0-100>,
+  "consistency_summary": "2-3 sentence factual summary of CV-interview alignment",
+  "verified_claims": [
+    {{
+      "cv_claim": "what the CV says",
+      "evidence": "what the candidate said that supports this",
+      "confidence": "high | medium | low"
+    }}
+  ],
+  "inconsistencies": [
+    {{
+      "cv_claim": "what the CV claims",
+      "interview_evidence": "what the candidate actually said",
+      "severity": "minor | moderate | significant",
+      "note": "brief factual observation"
+    }}
+  ]
+}}"""
+
+    try:
+        consistency_response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": consistency_prompt}],
+            temperature=0.2,
+        )
+        cv_consistency = json.loads(consistency_response.choices[0].message.content)
+    except Exception as e:
+        print(f"[cv consistency] Failed: {e}")
+        cv_consistency = {"error": "CV consistency check could not be completed"}
+
+    # Store all results
+    now = datetime.now(timezone.utc)
+    await interviews_collection.update_one(
+        {"token": token},
+        {"$set": {
+            "assessment": assessment,
+            "video_analysis": video_analysis,
+            "cv_consistency": cv_consistency,
+            "status": "Assessed",
+            "assessed_at": now.isoformat(),
+        }}
+    )
+
+    await matches_collection.update_one(
+        {"_id": interview["match_id"]},
+        {"$set": {"status": "Interview Completed", "updated_at": now}}
+    )
+
+    return {
+        "message": "Full assessment complete",
+        "assessment": assessment,
+        "video_analysis": video_analysis,
+        "cv_consistency": cv_consistency,
     }
 
 

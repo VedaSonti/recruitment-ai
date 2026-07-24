@@ -8,3 +8,4 @@ python-dotenv
 numpy
 python-docx
 pypdf
+Pillow
