@@ -622,7 +622,16 @@ async def get_interview_by_match(match_id: str):
         "job_title": interview["job_title"],
         "status": interview["status"],
         "questions": interview["questions"],
-        "responses": interview.get("responses", []),
+        "responses": [
+            {
+                "question_index": r.get("question_index"),
+                "question": r.get("question"),
+                "transcript": r.get("transcript"),
+                "submitted_at": r.get("submitted_at"),
+                # deliberately exclude frames_b64 - too large for API response
+            }
+            for r in interview.get("responses", [])
+        ],
         "assessment": interview.get("assessment"),
         "expires_at": interview["expires_at"].isoformat(),
         "created_at": interview["created_at"].isoformat(),
@@ -791,9 +800,9 @@ async def submit_video_response(token: str, video: UploadFile = File(...)):
             )
         transcript = transcription.text
 
-        # Extract a key frame from the video for later vision analysis
-        # We store a base64 encoded frame snapshot per response
-        frame_b64 = extract_video_frame(tmp_path)
+        # Extract multiple key frames from the video for later vision analysis
+        # We store base64 encoded frame snapshots per response
+        frames_b64 = extract_video_frames(tmp_path, num_frames=6)
 
     finally:
         os.remove(tmp_path)
@@ -802,7 +811,7 @@ async def submit_video_response(token: str, video: UploadFile = File(...)):
         "question_index": question_index,
         "question": interview["questions"][question_index],
         "transcript": transcript,
-        "frame_b64": frame_b64,   # stored for video analysis
+        "frames_b64": frames_b64,   # list of base64 frames, not single frame
         "submitted_at": now.isoformat(),
     }
 
@@ -834,32 +843,77 @@ async def submit_video_response(token: str, video: UploadFile = File(...)):
     }
 
 
-def extract_video_frame(video_path: str) -> str | None:
+def extract_video_frames(video_path: str, num_frames: int = 6) -> list[str]:
     """
-    Extract a single frame from a video file and return as base64.
-    Uses ffmpeg if available, otherwise returns None gracefully.
-    Frame is taken at 3 seconds in (after the candidate has settled).
+    Extract multiple frames from a video using OpenCV.
+    Returns a list of base64-encoded JPEG strings.
+
+    For a 30-second answer, extracts frames at evenly spaced intervals
+    giving GPT-4o Vision a temporal view of the candidate's presentation,
+    not just a single snapshot.
+
+    Returns empty list if OpenCV is unavailable or video cannot be read.
     """
     try:
-        import subprocess
-        frame_path = video_path + "_frame.jpg"
-        result = subprocess.run([
-            "ffmpeg", "-i", video_path,
-            "-ss", "00:00:03",    # 3 seconds in
-            "-vframes", "1",
-            "-q:v", "2",
-            frame_path,
-            "-y", "-loglevel", "quiet"
-        ], capture_output=True, timeout=30)
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"[video] OpenCV could not open: {video_path}")
+            return []
 
-        if result.returncode == 0 and os.path.exists(frame_path):
-            with open(frame_path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("utf-8")
-            os.remove(frame_path)
-            return b64
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25
+        duration_sec = total_frames / fps
+
+        if total_frames == 0 or duration_sec < 1:
+            cap.release()
+            return []
+
+        # Skip the first 1 second (candidate settling) and last 1 second
+        start_sec = min(1.0, duration_sec * 0.1)
+        end_sec = max(start_sec + 1, duration_sec - 1.0)
+
+        # Evenly spaced sample points
+        sample_times = [
+            start_sec + (end_sec - start_sec) * i / (num_frames - 1)
+            for i in range(num_frames)
+        ] if num_frames > 1 else [duration_sec / 2]
+
+        frames_b64 = []
+        for t in sample_times:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            # Resize to reduce payload size - 480p is enough for presentation analysis
+            h, w = frame.shape[:2]
+            if w > 640:
+                scale = 640 / w
+                frame = cv2.resize(frame, (640, int(h * scale)))
+
+            # Mirror the frame (front camera is typically mirrored)
+            frame = cv2.flip(frame, 1)
+
+            # Encode as JPEG
+            success, buffer = cv2.imencode(
+                ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75]
+            )
+            if success:
+                frames_b64.append(
+                    base64.b64encode(buffer).decode("utf-8")
+                )
+
+        cap.release()
+        print(f"[video] Extracted {len(frames_b64)} frames from {duration_sec:.1f}s video")
+        return frames_b64
+
+    except ImportError:
+        print("[video] OpenCV not installed - skipping frame extraction")
+        return []
     except Exception as e:
-        print(f"[video] Frame extraction failed: {e}")
-    return None
+        print(f"[video] Frame extraction error: {e}")
+        return []
 
 
 @app.post("/interviews/{token}/assess-video")
@@ -918,7 +972,14 @@ Return ONLY valid JSON:
 
     # --- GPT Call 2: Video/presentation analysis ---
     video_analysis = None
-    frames_available = [r for r in responses if r.get("frame_b64")]
+
+    # Collect frames across all responses - up to 3 frames per response, max 12 total
+    all_frames = []
+    for r in responses:
+        frames = r.get("frames_b64", [])
+        all_frames.extend(frames[:3])
+
+    frames_available = all_frames[:12]
 
     if frames_available:
         vision_messages = [
@@ -930,18 +991,21 @@ Return ONLY valid JSON:
                         "text": f"""You are assessing a candidate's video interview presentation.
 Candidate: {interview['candidate_name']}
 Role: {interview['job_title']}
+Interview format: Rapid-fire round, 30 seconds per question ({len(responses)} questions total)
 
-The following images are frames captured during the candidate's interview responses.
-Assess their professional presentation objectively.
+The following images are frames sampled throughout the candidate's interview responses,
+showing their presentation across the full duration of the interview.
+Assess their professional presentation objectively based on what you observe.
 
 Return ONLY valid JSON:
 {{
   "confidence_score": <0-100>,
-  "eye_contact": "brief observation about eye contact",
-  "presentation": "brief observation about professional appearance and setting",
-  "body_language": "brief observation about posture and engagement",
-  "communication_clarity": "brief observation about how clearly they spoke",
-  "flags": ["any specific concern worth noting, or empty array if none"]
+  "eye_contact": "brief observation about eye contact consistency across frames",
+  "presentation": "brief observation about professional appearance and environment",
+  "body_language": "brief observation about posture and engagement over time",
+  "communication_clarity": "brief observation about how they presented themselves",
+  "engagement_over_time": "did they maintain energy and focus throughout, or did it drop?",
+  "flags": ["specific concern worth noting, or empty array if none"]
 }}
 
 Be factual and brief. Do not make character judgements."""
@@ -950,11 +1014,11 @@ Be factual and brief. Do not make character judgements."""
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/jpeg;base64,{r['frame_b64']}",
+                            "url": f"data:image/jpeg;base64,{frame}",
                             "detail": "low"
                         }
                     }
-                    for r in frames_available[:3]
+                    for frame in frames_available
                 ]
             }
         ]

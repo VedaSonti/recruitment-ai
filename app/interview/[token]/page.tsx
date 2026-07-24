@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
-const MAX_RECORDING_SECONDS = 180;
+const MAX_RECORDING_SECONDS = 30;
 
 type Phase =
   | "loading"
@@ -342,13 +342,16 @@ export default function InterviewPage() {
               The AI will speak each question aloud. After it finishes, speak your answer and submit
               it when you are done.
             </p>
-            <p>
-              Estimated time: <strong>{interview.total_questions * 2}-{interview.total_questions * 3} minutes</strong>
-            </p>
+            <p>Each answer has a <strong>30-second limit</strong> — rapid fire round.</p>
+            <p>Estimated total time: <strong>{Math.ceil(interview.total_questions * 0.75)} minutes</strong></p>
           </div>
 
           <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
             Please ensure your microphone is enabled in your browser before starting.
+            <p className="mt-2 rounded bg-amber-50 px-2 py-1 text-sm text-amber-700">
+              ⚡ Rapid fire round — 30 seconds per question. Answer concisely and clearly.
+              Your answer auto-submits when time runs out.
+            </p>
           </div>
 
           <button
@@ -420,8 +423,28 @@ export default function InterviewPage() {
                 <Mic className="text-red-600" size={36} />
               </div>
               <p className="font-medium text-gray-700">Recording - speak your answer now</p>
-              <p className="font-mono text-2xl text-gray-900">{formatTime(recordingSeconds)}</p>
-              <p className="text-xs text-gray-400">Maximum 3 minutes</p>
+              <p
+                className={`font-mono text-2xl ${
+                  MAX_RECORDING_SECONDS - recordingSeconds <= 10 ? "text-red-600" : "text-gray-900"
+                }`}
+              >
+                {formatTime(MAX_RECORDING_SECONDS - recordingSeconds)}
+              </p>
+              <div className="h-2 w-full max-w-sm overflow-hidden rounded-full bg-gray-200">
+                <div
+                  className={`h-2 rounded-full transition-all duration-500 ${
+                    MAX_RECORDING_SECONDS - recordingSeconds <= 5
+                      ? "bg-red-500"
+                      : MAX_RECORDING_SECONDS - recordingSeconds <= 10
+                        ? "bg-amber-500"
+                        : "bg-[#7B1111]"
+                  }`}
+                  style={{ width: `${((MAX_RECORDING_SECONDS - recordingSeconds) / MAX_RECORDING_SECONDS) * 100}%` }}
+                />
+              </div>
+              <p className="text-xs text-gray-400">
+                30 seconds per answer — auto-submits when time runs out
+              </p>
               <button
                 className="rounded-xl bg-[#7B1111] px-8 py-3 font-semibold text-white transition hover:bg-[#6a0f0f]"
                 onClick={stopRecording}

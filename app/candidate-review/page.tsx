@@ -29,7 +29,17 @@ import {
 } from "@/src/lib/utils";
 
 type Disposition = "" | "Willing" | "Not Willing" | "No Show / Disappeared";
-type InterviewResult = Awaited<ReturnType<typeof getInterviewByMatch>>;
+type InterviewResult = Awaited<ReturnType<typeof getInterviewByMatch>> & {
+  video_analysis: {
+    confidence_score: number;
+    eye_contact: string;
+    presentation: string;
+    body_language: string;
+    communication_clarity: string;
+    engagement_over_time: string;
+    flags: string[];
+  } | null;
+};
 
 type FeedbackRow = {
   action: string;
@@ -420,7 +430,7 @@ export default function CandidateReviewPage() {
 
     try {
       const result = await getInterviewByMatch(id);
-      setInterviewResult(result);
+      setInterviewResult(result as InterviewResult);
       setActiveInterviewMatchId(id);
       setShowInterviewModal(true);
       setRowLoading(id, { viewingResults: false });
@@ -442,7 +452,7 @@ export default function CandidateReviewPage() {
 
     try {
       const result = await getInterviewByMatch(activeInterviewMatchId);
-      setInterviewResult(result);
+      setInterviewResult(result as InterviewResult);
       await refreshMatchesForCurrentJob();
     } finally {
       setIsRefreshingInterview(false);
@@ -902,6 +912,31 @@ function InterviewResultsModal({
               </div>
             )}
           </section>
+
+          {result.video_analysis ? (
+            <section className="rounded-[8px] border border-[#E5E7EB] p-4">
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                <h3 className="text-[18px] font-bold text-[#333438]">Presentation Analysis</h3>
+                <Badge tone={scoreTone(result.video_analysis.confidence_score)}>
+                  {result.video_analysis.confidence_score}/100
+                </Badge>
+              </div>
+              <div className="space-y-3">
+                {[
+                  ["Eye Contact", result.video_analysis.eye_contact],
+                  ["Presentation", result.video_analysis.presentation],
+                  ["Body Language", result.video_analysis.body_language],
+                  ["Communication", result.video_analysis.communication_clarity],
+                  ["Engagement", result.video_analysis.engagement_over_time],
+                ].map(([label, value]) => (
+                  <div className="rounded-[8px] bg-[#f9fafb] px-4 py-3" key={label}>
+                    <p className="text-[13px] font-bold text-[#333438]">{label}</p>
+                    <p className="mt-1 text-[14px] leading-6 text-[#555b66]">{value}</p>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
 
           {!assessment ? (
             <div className="rounded-[8px] border border-[#f7d06b] bg-[#fffbeb] p-4 text-[14px] font-bold text-[#a65f00]">
