@@ -602,7 +602,9 @@ Generate exactly 5 interview questions that are:
 2. Tailored to this candidate's background (probe gaps, explore strengths)
 3. A mix of technical questions (testing specific required skills) and behavioural questions
 4. Open-ended — no yes/no questions
-5. Each answerable verbally in 1-3 minutes
+5. Each question must be answerable verbally in approximately 30 seconds.
+6. Questions should be concise and focused.
+7. Avoid questions that require lengthy explanations or multi-part answers.
 
 For technical questions, reference specific technologies from the required skills list.
 For behavioural questions, reference the job domain ({job_domain}) and expected responsibilities.
@@ -640,6 +642,7 @@ Example format: ["Question one?", "Question two?", "Question three?", "Question 
         "job_title": job.get("title"),
         "token": token,
         "questions": questions,
+        "time_per_question_seconds": 30,
         "status": "Invited",
         "responses": [],
         "assessment": None,
@@ -662,8 +665,9 @@ Example format: ["Question one?", "Question two?", "Question three?", "Question 
       <p>Congratulations! You have been shortlisted for the
          <strong>{job.get('title')}</strong> position.</p>
       <p>Please complete an AI-powered screening interview at your convenience.
-         The interview has <strong>{len(questions)} questions</strong> and takes
-         approximately {len(questions) * 2}-{len(questions) * 3} minutes.</p>
+         The interview contains <strong>{len(questions)} questions</strong>. You will have
+         <strong>30 seconds</strong> to answer each question. The interview should take
+         approximately 3-4 minutes to complete.</p>
       <div style="text-align:center;margin:30px 0;">
         <a href="{interview_url}"
            style="background:#7B1111;color:#fff;padding:14px 28px;
@@ -709,6 +713,7 @@ async def get_interview_by_match(match_id: str):
         "job_title": interview["job_title"],
         "status": interview["status"],
         "questions": interview["questions"],
+        "time_per_question_seconds": interview.get("time_per_question_seconds", 30),
         "responses": [
             {
                 "question_index": r.get("question_index"),
@@ -750,6 +755,7 @@ async def get_interview(token: str):
             interview["questions"][answered]
             if answered < len(interview["questions"]) else None
         ),
+        "time_per_question_seconds": interview.get("time_per_question_seconds", 30),
         "status": interview["status"],
         "expires_at": interview["expires_at"].isoformat(),
     }

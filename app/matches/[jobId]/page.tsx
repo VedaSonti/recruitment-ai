@@ -322,8 +322,9 @@ function CandidateTable({
             {matches.map((match, index) => {
               const matchId = getMatchId(match);
               const percent = scoreToPercent(match.score ?? match.match_score);
-              const tech = match.analysis?.tech_match_percentage ?? Math.min(99, Math.round(percent * 1.02));
-              const exp = match.analysis?.exp_match_percentage ?? Math.round(percent * 0.98);
+              const isAnalysed = hasDetailedAnalysis(match);
+              const tech = isAnalysed ? getTechnicalAnalysisScore(match) : null;
+              const exp = isAnalysed ? getExperienceAnalysisScore(match) : null;
               const status = statusOverrides[matchId] ?? match.status ?? "Matched";
               const rowState = actionState[matchId] ?? {};
               const isBusy = Boolean(rowState.loading);
@@ -344,11 +345,18 @@ function CandidateTable({
                   <td className="px-5 py-4">
                     <ScorePill value={percent} />
                   </td>
-                  <td className="px-5 py-4 text-[14px] text-[#333438]">{tech}%</td>
-                  <td className="px-5 py-4 text-[14px] text-[#333438]">{exp}%</td>
+                  <td className="px-5 py-4 text-[14px] text-[#333438]">
+                    <AnalysisScoreValue isAnalysed={isAnalysed} value={tech} />
+                  </td>
+                  <td className="px-5 py-4 text-[14px] text-[#333438]">
+                    <AnalysisScoreValue isAnalysed={isAnalysed} value={exp} />
+                  </td>
                   <td className="px-5 py-4 text-[14px] font-bold text-[#00a650]">Yes</td>
                   <td className="px-5 py-4">
-                    <Badge tone={matchStatusTone(status)}>{status}</Badge>
+                    <div className="flex flex-col items-start gap-1.5">
+                      <Badge tone={matchStatusTone(status)}>{status}</Badge>
+                      {isAnalysed ? <Badge tone="green">Analysed</Badge> : null}
+                    </div>
                   </td>
                   <td className="px-5 py-4">
                     <div className="flex flex-wrap items-center gap-3">
@@ -394,6 +402,43 @@ function CandidateTable({
       </div>
     </Card>
   );
+}
+
+function getNumericScore(value?: number | null) {
+  return typeof value === "number" && Number.isFinite(value) ? Math.round(value) : null;
+}
+
+function hasDetailedAnalysis(match: Match) {
+  return Boolean(match.analysis || match.analysis_generated_at);
+}
+
+function getTechnicalAnalysisScore(match: Match) {
+  return (
+    getNumericScore(match.analysis?.tech_match_percentage) ??
+    getNumericScore(match.skill_analysis?.semantic_skill_score)
+  );
+}
+
+function getExperienceAnalysisScore(match: Match) {
+  return getNumericScore(match.analysis?.exp_match_percentage);
+}
+
+function AnalysisScoreValue({
+  isAnalysed,
+  value,
+}: {
+  isAnalysed: boolean;
+  value: number | null;
+}) {
+  if (!isAnalysed) {
+    return <span className="text-[13px] font-semibold text-[#9ca0a8]">Not analysed</span>;
+  }
+
+  if (value === null) {
+    return <span className="text-[13px] font-semibold text-[#9ca0a8]">--</span>;
+  }
+
+  return <span>{value}%</span>;
 }
 
 function ActionLink({
