@@ -95,7 +95,7 @@ export function CandidateDetail({
           setJob(jobDetails);
           setMatch(matchDetails);
           setAnalysis(matchDetails?.analysis ?? null);
-          setSkillAnalysis(matchDetails?.skill_analysis ?? null);
+          setSkillAnalysis(null);
           setAnalysisGeneratedAt(matchDetails?.analysis_generated_at ?? "");
         }
       } catch (requestError) {
@@ -125,7 +125,7 @@ export function CandidateDetail({
     const matchId = match ? getMatchId(match) : "";
 
     async function loadSkills() {
-      if (!jobId || !matchId || skillAnalysis) {
+      if (!jobId || !matchId) {
         return;
       }
       setSkillLoading(true);
@@ -150,7 +150,7 @@ export function CandidateDetail({
     return () => {
       mounted = false;
     };
-  }, [jobId, match, skillAnalysis]);
+  }, [jobId, match]);
 
   const scorePercent = scoreToPercent(match?.score ?? match?.match_score);
   const candidateName = candidate?.name ?? match?.candidate_name ?? "Candidate";
@@ -177,7 +177,7 @@ export function CandidateDetail({
     const refreshed = await getMatch(matchId);
     setMatch(refreshed);
     setAnalysis(refreshed.analysis ?? null);
-    setSkillAnalysis(refreshed.skill_analysis ?? null);
+    setSkillAnalysis(null);
     setAnalysisGeneratedAt(refreshed.analysis_generated_at ?? "");
   }
 
@@ -192,11 +192,7 @@ export function CandidateDetail({
       setMatch(refreshed);
       setAnalysis(refreshed.analysis ?? null);
       setAnalysisGeneratedAt(refreshed.analysis_generated_at ?? "");
-      if (refreshed.skill_analysis) {
-        setSkillAnalysis(refreshed.skill_analysis);
-      } else {
-        setSkillAnalysis(await getSkillAnalysis(getMatchId(match)));
-      }
+      setSkillAnalysis(await getSkillAnalysis(getMatchId(match)));
     } finally {
       setIsAnalysing(false);
     }

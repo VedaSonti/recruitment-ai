@@ -18,6 +18,7 @@ This gives you an interactive page to test every endpoint without Postman.
 """
 
 import os
+import re
 import base64
 import json
 import hashlib
@@ -152,56 +153,231 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
+def normalize_skill(skill: str) -> str:
+    """Normalize skill labels before exact, alias, or embedding comparison."""
+    lowered = (skill or "").lower().strip()
+    standardized = re.sub(r"[&/+\-]+", " ", lowered)
+    standardized = re.sub(r"[^a-z0-9]+", " ", standardized)
+    return " ".join(standardized.split())
+
+
+_RAW_SKILL_ALIASES = {
+    "ai/ml": [
+        "ai ml",
+        "artificial intelligence",
+        "machine learning",
+        "natural language processing",
+        "computer vision",
+        "deep learning",
+        "large language models",
+        "generative ai",
+    ],
+    "ai": ["artificial intelligence"],
+    "ml": ["machine learning"],
+    "nlp": ["natural language processing"],
+    "cv": ["computer vision"],
+    "dl": ["deep learning"],
+    "llm": ["large language model"],
+    "llms": ["large language models", "generative ai"],
+    "rag": ["retrieval augmented generation"],
+    "rpa": ["robotic process automation"],
+    "etl": ["extract transform load"],
+    "elt": ["extract load transform"],
+    "bi": ["business intelligence"],
+    "erp": ["enterprise resource planning"],
+    "crm": ["customer relationship management"],
+    "api": ["application programming interface"],
+    "rest": ["restful api web services"],
+    "ci/cd": ["continuous integration continuous deployment"],
+    "devops": ["development operations deployment"],
+    "mlops": ["machine learning operations deployment"],
+    "qa": ["quality assurance testing"],
+    "ux": ["user experience design"],
+    "ui": ["user interface design"],
+    "saas": ["software as a service cloud"],
+    "paas": ["platform as a service cloud"],
+    "iaas": ["infrastructure as a service cloud"],
+    "sql": ["structured query language database"],
+    "nosql": ["non relational database"],
+    "oop": ["object oriented programming"],
+    "aws": ["amazon web services cloud"],
+    "gcp": ["google cloud platform"],
+    "azure": ["microsoft azure cloud"],
+    "k8s": ["kubernetes container orchestration"],
+    "tf": ["tensorflow machine learning"],
+    "pytorch": ["pytorch deep learning framework"],
+}
+
+
+def _normalize_alias_dictionary(raw_aliases: dict[str, list[str]]) -> dict[str, set[str]]:
+    return {
+        normalize_skill(key): {normalize_skill(value) for value in values if normalize_skill(value)}
+        for key, values in raw_aliases.items()
+    }
+
+
+SKILL_ALIASES = _normalize_alias_dictionary(_RAW_SKILL_ALIASES)
+
+
+def skill_alias_terms(skill: str) -> set[str]:
+    normalized = normalize_skill(skill)
+    terms = {normalized} if normalized else set()
+    terms.update(SKILL_ALIASES.get(normalized, set()))
+    return terms
+
+
 def expand_skill_abbreviations(skill: str) -> str:
     """
     Expand common tech abbreviations before embedding.
     Short abbreviations have weak embeddings - expanding them improves
     semantic matching significantly.
-
-    Examples:
-      "AI/ML" -> "artificial intelligence machine learning"
-      "NLP"   -> "natural language processing"
-      "CV"    -> "computer vision"
     """
-    expansions = {
-        "ai/ml": "artificial intelligence machine learning",
-        "ai": "artificial intelligence",
-        "ml": "machine learning",
-        "nlp": "natural language processing",
-        "cv": "computer vision",
-        "dl": "deep learning",
-        "llm": "large language model",
-        "rag": "retrieval augmented generation",
-        "rpa": "robotic process automation",
-        "etl": "extract transform load",
-        "elt": "extract load transform",
-        "bi": "business intelligence",
-        "erp": "enterprise resource planning",
-        "crm": "customer relationship management",
-        "api": "application programming interface",
-        "rest": "restful api web services",
-        "ci/cd": "continuous integration continuous deployment",
-        "devops": "development operations deployment",
-        "mlops": "machine learning operations deployment",
-        "qa": "quality assurance testing",
-        "ux": "user experience design",
-        "ui": "user interface design",
-        "saas": "software as a service cloud",
-        "paas": "platform as a service cloud",
-        "iaas": "infrastructure as a service cloud",
-        "sql": "structured query language database",
-        "nosql": "non-relational database",
-        "oop": "object oriented programming",
-        "aws": "amazon web services cloud",
-        "gcp": "google cloud platform",
-        "azure": "microsoft azure cloud",
-        "k8s": "kubernetes container orchestration",
-        "tf": "tensorflow machine learning",
-        "pytorch": "pytorch deep learning framework",
-        "llms": "large language models generative ai",
+    aliases = skill_alias_terms(skill)
+    return " ".join(sorted(aliases)) if aliases else skill
+
+
+def find_exact_skill_match(required_skill: str, candidate_skills: list[str]) -> str | None:
+    normalized_required = normalize_skill(required_skill)
+    for candidate_skill in candidate_skills:
+        if normalize_skill(candidate_skill) == normalized_required:
+            return candidate_skill
+    return None
+
+
+def find_alias_skill_match(required_skill: str, candidate_skills: list[str]) -> str | None:
+    required_terms = skill_alias_terms(required_skill)
+    for candidate_skill in candidate_skills:
+        candidate_terms = skill_alias_terms(candidate_skill)
+        if required_terms.intersection(candidate_terms):
+            return candidate_skill
+    return None
+
+
+def log_skill_alias_diagnostic(
+    required_skill: str,
+    normalized_required: str,
+    candidate_normalized_skills: list[str],
+    alias_match_found: bool,
+    matched_with: str | None,
+) -> None:
+    if normalized_required == "ai ml":
+        print(
+            "[skill-analysis] "
+            f"Required skill: {required_skill}; "
+            f"Normalized required skill: {normalized_required}; "
+            f"Candidate normalized skills: {candidate_normalized_skills}; "
+            f"Alias match found: {alias_match_found}; "
+            f"Matched with: {matched_with or 'None'}"
+        )
+
+
+def build_skill_analysis_result(
+    match_id: str,
+    job_skills: list[str],
+    cand_skills: list[str],
+    job_embeddings: list[list[float]] | None = None,
+    cand_embeddings: list[list[float]] | None = None,
+) -> dict:
+    matched = []
+    partial = []
+    missing = []
+    candidate_normalized_skills = [normalize_skill(skill) for skill in cand_skills]
+
+    for i, job_skill in enumerate(job_skills):
+        normalized_required = normalize_skill(job_skill)
+        exact_match = find_exact_skill_match(job_skill, cand_skills)
+        if exact_match:
+            matched.append({
+                "required": job_skill,
+                "matched_with": exact_match,
+                "similarity": 1.0,
+                "type": "strong",
+                "match_reason": "exact_normalized",
+            })
+            log_skill_alias_diagnostic(
+                job_skill,
+                normalized_required,
+                candidate_normalized_skills,
+                False,
+                exact_match,
+            )
+            continue
+
+        alias_match = find_alias_skill_match(job_skill, cand_skills)
+        if alias_match:
+            matched.append({
+                "required": job_skill,
+                "matched_with": alias_match,
+                "similarity": 1.0,
+                "type": "strong",
+                "match_reason": "category_alias",
+            })
+            log_skill_alias_diagnostic(
+                job_skill,
+                normalized_required,
+                candidate_normalized_skills,
+                True,
+                alias_match,
+            )
+            continue
+
+        best_score = 0.0
+        best_cand_skill = None
+        if job_embeddings is not None and cand_embeddings is not None:
+            for j, cand_skill in enumerate(cand_skills):
+                score = cosine_similarity(job_embeddings[i], cand_embeddings[j])
+                if score > best_score:
+                    best_score = score
+                    best_cand_skill = cand_skill
+
+        log_skill_alias_diagnostic(
+            job_skill,
+            normalized_required,
+            candidate_normalized_skills,
+            False,
+            best_cand_skill,
+        )
+
+        if best_score >= 0.80:
+            matched.append({
+                "required": job_skill,
+                "matched_with": best_cand_skill,
+                "similarity": round(best_score, 3),
+                "type": "strong",
+                "match_reason": "embedding_similarity",
+            })
+        elif best_score >= 0.65:
+            partial.append({
+                "required": job_skill,
+                "closest_match": best_cand_skill,
+                "similarity": round(best_score, 3),
+                "type": "partial",
+                "match_reason": "embedding_similarity",
+            })
+        else:
+            missing.append({
+                "required": job_skill,
+                "closest_match": best_cand_skill,
+                "similarity": round(best_score, 3),
+                "type": "missing",
+                "match_reason": "embedding_similarity" if best_cand_skill else "no_match",
+            })
+
+    semantic_score = round(
+        ((len(matched) + 0.5 * len(partial)) / len(job_skills)) * 100
+    ) if job_skills else 0
+
+    return {
+        "match_id": match_id,
+        "semantic_skill_score": semantic_score,
+        "matched": matched,
+        "partial": partial,
+        "missing": missing,
+        "summary": (
+            f"{len(matched)} strong match(es), {len(partial)} transferable "
+            f"skill(s), {len(missing)} gap(s) out of {len(job_skills)} required skills"
+        ),
     }
-    lower = skill.lower().strip()
-    return expansions.get(lower, skill)
 
 def build_vector_search_pipeline(query_vector: list[float], result_limit: int) -> list[dict]:
     limit = max(1, result_limit)
@@ -317,14 +493,35 @@ async def analyse_match(match_id: str):
     job_years = job.get("min_years_experience") or 0
     cand_years = candidate.get("years_experience") or 0
 
-    # Calculate skill overlap
-    job_skills_lower = [s.lower() for s in job_skills]
-    cand_skills_lower = [s.lower() for s in cand_skills]
-    matched_skills = [s for s in job_skills if s.lower() in cand_skills_lower]
-    missing_skills = [s for s in job_skills if s.lower() not in cand_skills_lower]
+    # Calculate skill coverage: exact normalized match, alias/category match, then embeddings.
+    skill_analysis = build_skill_analysis_result(match_id, job_skills, cand_skills)
+    if job_skills and cand_skills:
+        try:
+            expanded_job_skills = [expand_skill_abbreviations(s) for s in job_skills]
+            expanded_cand_skills = [expand_skill_abbreviations(s) for s in cand_skills]
+            all_skills_to_embed = expanded_job_skills + expanded_cand_skills
+            embed_response = client.embeddings.create(
+                model=EMBED_MODEL, input=all_skills_to_embed
+            )
+            embeddings = [r.embedding for r in embed_response.data]
+            job_embeddings = embeddings[:len(job_skills)]
+            cand_embeddings = embeddings[len(job_skills):]
+            skill_analysis = build_skill_analysis_result(
+                match_id,
+                job_skills,
+                cand_skills,
+                job_embeddings,
+                cand_embeddings,
+            )
+        except Exception:
+            # Keep deterministic exact/alias results if embedding fallback is unavailable.
+            pass
+
+    matched_skills = [item["required"] for item in skill_analysis["matched"]]
+    missing_skills = [item["required"] for item in skill_analysis["missing"]]
 
     # Calculate tech match %
-    tech_match = round((len(matched_skills) / len(job_skills) * 100)) if job_skills else 0
+    tech_match = skill_analysis["semantic_skill_score"] if job_skills else 0
 
     # Calculate experience match - combines years and domain relevance
     if job_years == 0:
@@ -453,9 +650,7 @@ async def get_skill_analysis(match_id: str):
     if not m:
         raise HTTPException(404, "Match not found")
 
-    # Return cached result if already computed
-    if m.get("skill_analysis"):
-        return m["skill_analysis"]
+    # Always recalculate so older cached alias results cannot stay stale.
 
     job = await jobs_collection.find_one({"_id": m["job_id"]})
     candidate = await candidates_collection.find_one({"_id": m["candidate_id"]})
@@ -473,11 +668,18 @@ async def get_skill_analysis(match_id: str):
             "matched": [],
             "partial": [],
             "missing": [
-                {"required": s, "similarity": 0, "type": "missing"}
+                {"required": s, "similarity": 0, "type": "missing", "match_reason": "no_candidate_skills"}
                 for s in job_skills
             ],
             "summary": "No skills available for comparison"
         }
+        await matches_collection.update_one(
+            {"_id": ObjectId(match_id)},
+            {"$set": {
+                "skill_analysis": result,
+                "skill_analysis_at": datetime.now(timezone.utc),
+            }}
+        )
         return result
 
     # Embed all skills in one batch call - cheaper than one call per skill
@@ -491,57 +693,13 @@ async def get_skill_analysis(match_id: str):
     job_embeddings = embeddings[:len(job_skills)]
     cand_embeddings = embeddings[len(job_skills):]
 
-    matched = []
-    partial = []
-    missing = []
-
-    for i, job_skill in enumerate(job_skills):
-        best_score = 0.0
-        best_cand_skill = None
-
-        for j, cand_skill in enumerate(cand_skills):
-            score = cosine_similarity(job_embeddings[i], cand_embeddings[j])
-            if score > best_score:
-                best_score = score
-                best_cand_skill = cand_skill
-
-        if best_score >= 0.80:
-            matched.append({
-                "required": job_skill,
-                "matched_with": best_cand_skill,
-                "similarity": round(best_score, 3),
-                "type": "strong"
-            })
-        elif best_score >= 0.65:
-            partial.append({
-                "required": job_skill,
-                "closest_match": best_cand_skill,
-                "similarity": round(best_score, 3),
-                "type": "partial"
-            })
-        else:
-            missing.append({
-                "required": job_skill,
-                "closest_match": best_cand_skill,
-                "similarity": round(best_score, 3),
-                "type": "missing"
-            })
-
-    semantic_score = round(
-        ((len(matched) + 0.5 * len(partial)) / len(job_skills)) * 100
-    ) if job_skills else 0
-
-    result = {
-        "match_id": match_id,
-        "semantic_skill_score": semantic_score,
-        "matched": matched,
-        "partial": partial,
-        "missing": missing,
-        "summary": (
-            f"{len(matched)} strong match(es), {len(partial)} transferable "
-            f"skill(s), {len(missing)} gap(s) out of {len(job_skills)} required skills"
-        )
-    }
+    result = build_skill_analysis_result(
+        match_id,
+        job_skills,
+        cand_skills,
+        job_embeddings,
+        cand_embeddings,
+    )
 
     # Cache on the match document so subsequent calls are instant
     await matches_collection.update_one(

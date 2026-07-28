@@ -103,6 +103,12 @@ export interface SkillMatch {
   closest_match?: string;
   similarity: number;
   type: "strong" | "partial" | "missing";
+  match_reason?:
+    | "exact_normalized"
+    | "category_alias"
+    | "embedding_similarity"
+    | "no_candidate_skills"
+    | "no_match";
 }
 
 export interface SkillAnalysis {
