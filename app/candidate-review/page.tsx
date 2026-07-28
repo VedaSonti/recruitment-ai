@@ -31,6 +31,20 @@ import {
 type Disposition = "" | "Willing" | "Not Willing" | "No Show / Disappeared";
 type InterviewResult = Awaited<ReturnType<typeof getInterviewByMatch>>;
 
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
+
+function resolveMediaUrl(url?: string | null) {
+  if (!url) {
+    return null;
+  }
+
+  if (/^https?:\/\//i.test(url)) {
+    return url;
+  }
+
+  return `${API_BASE_URL}${url.startsWith("/") ? url : `/${url}`}`;
+}
+
 type FeedbackRow = {
   action: string;
   comments: string;
@@ -918,7 +932,15 @@ function InterviewResultsModal({
                         <p className="mt-3 text-[13px] italic text-[#77777a]">{answerAssessment.comment}</p>
                       ) : null}
                       {response.video_url ? (
-                        <video className="mt-4 w-full rounded-[8px] border border-[#E5E7EB]" controls src={response.video_url} />
+                        <video
+                          className="mt-4 w-full rounded-[8px] border border-[#E5E7EB]"
+                          controls
+                          src={resolveMediaUrl(response.video_url) ?? undefined}
+                        />
+                      ) : response.video_available ? (
+                        <p className="mt-4 rounded-[8px] border border-[#E5E7EB] bg-[#f9fafb] p-3 text-[13px] text-[#77777a]">
+                          Video playback is unavailable for this historical response.
+                        </p>
                       ) : null}
                       {responseVideo ? (
                         <div className="mt-4 rounded-[8px] bg-[#f9fafb] p-3">

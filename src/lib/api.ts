@@ -455,6 +455,10 @@ export async function getInterviewByMatch(matchId: string): Promise<{
     transcript: string;
     submitted_at: string;
     video_url?: string | null;
+    video_available?: boolean;
+    video_size_bytes?: number | null;
+    video_duration_seconds?: number | null;
+    video_content_type?: string | null;
     video_observations?: {
       face_visible_percentage: number | null;
       speaking_time_seconds: number | null;

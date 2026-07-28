@@ -181,6 +181,21 @@ class VideoObservationSafetyTests(unittest.TestCase):
         self.assertEqual(result["video_analysis_status"], "failed")
         self.assertIn("video_observations", result)
 
+    def test_video_recorded_but_frame_analysis_failed(self):
+        result = build_unavailable_video_analysis(
+            "Video recorded, but visual frame analysis failed.",
+            [sample_response()],
+            status="failed",
+            video_available=True,
+        )
+        quality = result["video_observations"]["recording_quality"]
+        self.assertEqual(result["video_analysis_status"], "failed")
+        self.assertTrue(quality["video_available"])
+        self.assertIn(
+            "Video recorded, but visual frame analysis failed.",
+            result["video_observations"]["neutral_summary"],
+        )
+
     def test_refresh_repeatedly_is_guarded_by_processing_status(self):
         source = Path(__file__).with_name("main.py").read_text(encoding="utf-8")
         self.assertIn('interview.get("video_analysis_status") == "processing"', source)

@@ -24,6 +24,7 @@ import json
 import hashlib
 import tempfile
 import io
+from pathlib import Path
 import smtplib
 import secrets
 from datetime import datetime, timezone, timedelta
@@ -35,6 +36,7 @@ from bson import ObjectId
 import numpy as np
 from PIL import Image
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pymongo.errors import DuplicateKeyError
@@ -61,8 +63,75 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "")
 EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "iSOFT Recruitment")
 
+BACKEND_DIR = Path(__file__).resolve().parent
+INTERVIEW_MEDIA_ROOT = BACKEND_DIR / "media" / "interviews"
+
 CHAT_MODEL = "gpt-4o-mini"
 EMBED_MODEL = "text-embedding-3-small"
+
+def safe_interview_video_path(interview_id, question_index: int) -> Path:
+    """Return a controlled local path for persisted interview response video."""
+    if question_index < 0:
+        raise HTTPException(400, "Invalid question index")
+
+    safe_interview_id = re.sub(r"[^a-fA-F0-9]", "", str(interview_id))
+    if not safe_interview_id:
+        raise HTTPException(400, "Invalid interview id")
+
+    media_root = INTERVIEW_MEDIA_ROOT.resolve()
+    response_dir = (media_root / safe_interview_id).resolve()
+    video_path = (response_dir / f"{question_index}.webm").resolve()
+
+    if media_root != video_path and media_root not in video_path.parents:
+        raise HTTPException(400, "Invalid video path")
+
+    return video_path
+
+
+def resolve_stored_interview_video_path(response: dict) -> Optional[Path]:
+    """Resolve a stored response video path only if it remains inside media root."""
+    stored_path = response.get("video_path")
+    if not stored_path:
+        return None
+
+    try:
+        media_root = INTERVIEW_MEDIA_ROOT.resolve()
+        video_path = Path(stored_path).resolve()
+    except (OSError, RuntimeError):
+        return None
+
+    if media_root != video_path and media_root not in video_path.parents:
+        return None
+
+    return video_path
+
+
+def get_video_duration_seconds(video_path: str) -> Optional[float]:
+    """Best-effort video duration from OpenCV metadata."""
+    try:
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0
+        cap.release()
+        if total_frames <= 0 or fps <= 0:
+            return None
+        return round(total_frames / fps, 1)
+    except Exception:
+        return None
+
+
+def response_has_video(response: dict) -> bool:
+    return bool(
+        response.get("video_url")
+        or response.get("video_path")
+        or response.get("video_size_bytes")
+        or response.get("video_content_type")
+        or response.get("frames_b64")
+    )
+
 
 def send_email(to_address: str, subject: str, html_body: str) -> bool:
     """
@@ -895,7 +964,11 @@ async def get_interview_by_match(match_id: str):
                 "submitted_at": r.get("submitted_at"),
                 "video_observations": r.get("video_observations"),
                 "video_url": r.get("video_url"),
-                # deliberately exclude frames_b64 - too large for API response
+                "video_available": response_has_video(r),
+                "video_size_bytes": r.get("video_size_bytes"),
+                "video_duration_seconds": r.get("video_duration_seconds"),
+                "video_content_type": r.get("video_content_type"),
+                # deliberately exclude frames_b64 and video_path - too large/sensitive for API response
             }
             for r in interview.get("responses", [])
         ],
@@ -906,6 +979,36 @@ async def get_interview_by_match(match_id: str):
         "expires_at": interview["expires_at"].isoformat(),
         "created_at": interview["created_at"].isoformat(),
     }
+
+
+@app.get("/interviews/by-match/{match_id}/responses/{question_index}/video")
+async def get_interview_response_video(match_id: str, question_index: int):
+    """Controlled recruiter playback endpoint for persisted interview response video."""
+    interview = await interviews_collection.find_one({"match_id": ObjectId(match_id)})
+    if not interview:
+        raise HTTPException(404, "No interview found for this match")
+
+    response = next(
+        (
+            r for r in interview.get("responses", [])
+            if r.get("question_index") == question_index
+        ),
+        None,
+    )
+    if not response:
+        raise HTTPException(404, "Interview response not found")
+
+    video_path = resolve_stored_interview_video_path(response)
+    if not video_path or not video_path.exists() or not video_path.is_file():
+        raise HTTPException(404, "Stored video file not found")
+
+    media_type = response.get("video_content_type") or "video/webm"
+    return FileResponse(
+        path=str(video_path),
+        media_type=media_type,
+        filename=video_path.name,
+    )
+
 
 
 @app.get("/interviews/{token}")
@@ -1058,10 +1161,13 @@ async def submit_video_response(token: str, video: UploadFile = File(...)):
     if question_index >= len(interview["questions"]):
         raise HTTPException(400, "All questions already answered")
 
-    # Save video to temp file
+    # Save video to a temp file for Whisper/OpenCV, then persist a controlled copy
     suffix = ".webm"
+    video_bytes = await video.read()
+    video_size_bytes = len(video_bytes)
+    persisted_video_path = safe_interview_video_path(interview["_id"], question_index)
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await video.read())
+        tmp.write(video_bytes)
         tmp_path = tmp.name
 
     try:
@@ -1075,14 +1181,31 @@ async def submit_video_response(token: str, video: UploadFile = File(...)):
         # Extract multiple key frames from the video for later vision analysis
         # We store base64 encoded frame snapshots per response
         frames_b64 = extract_video_frames(tmp_path, num_frames=6)
+        video_duration_seconds = get_video_duration_seconds(tmp_path)
 
+        persisted_video_path.parent.mkdir(parents=True, exist_ok=True)
+        persisted_video_path.write_bytes(video_bytes)
     finally:
         os.remove(tmp_path)
+
+    video_url = f"/interviews/by-match/{str(interview['match_id'])}/responses/{question_index}/video"
+    video_content_type = video.content_type or "video/webm"
+    print(
+        "[video] response saved "
+        f"q={question_index} path={persisted_video_path} "
+        f"bytes={video_size_bytes} frames={len(frames_b64)} "
+        f"status={'pending' if frames_b64 else 'failed'}"
+    )
 
     response_doc = {
         "question_index": question_index,
         "question": interview["questions"][question_index],
         "transcript": transcript,
+        "video_path": str(persisted_video_path),
+        "video_url": video_url,
+        "video_size_bytes": video_size_bytes,
+        "video_duration_seconds": video_duration_seconds,
+        "video_content_type": video_content_type,
         "frames_b64": frames_b64,   # list of base64 frames, not single frame
         "submitted_at": now.isoformat(),
     }
@@ -1090,11 +1213,14 @@ async def submit_video_response(token: str, video: UploadFile = File(...)):
     new_responses = interview.get("responses", []) + [response_doc]
     all_done = len(new_responses) >= len(interview["questions"])
 
+    next_video_analysis_status = "pending" if any(r.get("frames_b64") for r in new_responses) else "failed"
+
     await interviews_collection.update_one(
         {"token": token},
         {"$set": {
             "responses": new_responses,
             "status": "Completed" if all_done else "Started",
+            "video_analysis_status": next_video_analysis_status,
         }}
     )
 
@@ -1301,7 +1427,12 @@ def base_response_video_observations(response: dict) -> dict:
     }
 
 
-def build_unavailable_video_analysis(reason: str, responses: list[dict], status: str = "unavailable") -> dict:
+def build_unavailable_video_analysis(
+    reason: str,
+    responses: list[dict],
+    status: str = "unavailable",
+    video_available: bool = False,
+) -> dict:
     per_response = [
         {
             "question_index": response.get("question_index"),
@@ -1317,7 +1448,7 @@ def build_unavailable_video_analysis(reason: str, responses: list[dict], status:
         "video_analysis_status": status if status in VIDEO_ANALYSIS_STATUSES else "unavailable",
         "video_observations": {
             "recording_quality": {
-                "video_available": False,
+                "video_available": video_available,
                 "audio_available": any((response.get("transcript") or "").strip() for response in responses),
                 "face_visible_percentage": None,
                 "multiple_faces_detected": None,
@@ -1456,7 +1587,18 @@ async def assess_interview_with_video(token: str):
             "cv_consistency": interview.get("cv_consistency"),
         }
 
-    if interview.get("assessment") and interview.get("video_analysis_status") in ("completed", "failed", "unavailable"):
+    responses = interview.get("responses", [])
+    stored_has_frames = any(response.get("frames_b64") for response in responses)
+    stale_unavailable_with_frames = (
+        interview.get("video_analysis_status") == "unavailable"
+        and stored_has_frames
+    )
+
+    if (
+        interview.get("assessment")
+        and interview.get("video_analysis_status") in ("completed", "failed", "unavailable")
+        and not stale_unavailable_with_frames
+    ):
         return {
             "message": "Already assessed",
             "assessment": interview.get("assessment"),
@@ -1472,8 +1614,6 @@ async def assess_interview_with_video(token: str):
 
     job = await jobs_collection.find_one({"_id": interview["job_id"]})
     candidate = await candidates_collection.find_one({"_id": interview["candidate_id"]})
-    responses = interview.get("responses", [])
-
     qa_text = "\n\n".join([
         f"Q{i+1}: {r['question']}\nA: {r.get('transcript', '')}"
         for i, r in enumerate(responses)
@@ -1526,11 +1666,19 @@ Return ONLY valid JSON:
         if len(all_frame_items) >= 12:
             break
 
+    any_video_uploaded = any(response_has_video(response) for response in responses)
+
     if not all_frame_items:
+        missing_frames_reason = (
+            "Video recorded, but visual frame analysis failed."
+            if any_video_uploaded
+            else "No sampled video frames were available for neutral presentation observations."
+        )
         video_analysis = build_unavailable_video_analysis(
-            "No sampled video frames were available for neutral presentation observations.",
+            missing_frames_reason,
             responses,
-            status="unavailable",
+            status="failed" if any_video_uploaded else "unavailable",
+            video_available=any_video_uploaded,
         )
     else:
         content = [
@@ -1626,10 +1774,18 @@ Return ONLY valid JSON in this exact shape:
         except Exception as e:
             print(f"[video analysis] Failed: {e}")
             video_analysis = build_unavailable_video_analysis(
-                "Video observations could not be completed because processing failed.",
+                "Video recorded, but visual frame analysis failed.",
                 responses,
                 status="failed",
+                video_available=any_video_uploaded,
             )
+
+    print(
+        "[video analysis] "
+        f"frames={len(all_frame_items)} "
+        f"status={video_analysis.get('video_analysis_status')} "
+        f"video_available={video_analysis.get('video_observations', {}).get('recording_quality', {}).get('video_available')}"
+    )
 
     updated_responses = apply_video_observations_to_responses(responses, video_analysis)
 
