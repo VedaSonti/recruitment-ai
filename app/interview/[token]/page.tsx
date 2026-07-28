@@ -554,7 +554,7 @@ export default function InterviewPage() {
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex min-h-screen flex-col bg-gray-50">
+    <div className="fixed inset-0 z-50 flex min-h-screen flex-col overflow-y-auto bg-gray-50">
       <div className="border-b border-gray-200 bg-white px-6 py-4">
         <div className="mx-auto max-w-2xl">
           <div className="mb-2 flex justify-between text-sm text-gray-500">
@@ -572,7 +572,7 @@ export default function InterviewPage() {
         </div>
       </div>
 
-      <div className="flex flex-1 items-center justify-center overflow-y-auto p-6">
+      <div className="flex flex-1 items-center justify-center p-6">
         <div className="w-full max-w-2xl space-y-6">
           <div className="rounded-2xl border border-gray-200 bg-white p-8 shadow-sm">
             <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-[#7B1111]">
@@ -712,8 +712,10 @@ function CameraPreview({
 
 function Screen({ children }: { children: ReactNode }) {
   return (
-    <div className="fixed inset-0 z-50 flex min-h-screen flex-col items-center justify-center bg-gray-50 p-6">
-      <div className="flex flex-col items-center text-center">{children}</div>
+    <div className="fixed inset-0 z-50 overflow-y-auto bg-gray-50 p-6">
+      <div className="mx-auto flex min-h-[calc(100vh-3rem)] flex-col items-center justify-center text-center">
+        {children}
+      </div>
     </div>
   );
 }
