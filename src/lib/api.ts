@@ -447,12 +447,24 @@ export async function getInterviewByMatch(matchId: string): Promise<{
   candidate_email: string;
   job_title: string;
   status: string;
+  profile_match_score: number | null;
   questions: string[];
   responses: Array<{
     question_index: number;
     question: string;
     transcript: string;
     submitted_at: string;
+    video_url?: string | null;
+    video_observations?: {
+      face_visible_percentage: number | null;
+      speaking_time_seconds: number | null;
+      filler_word_count: number | null;
+      long_pause_count: number | null;
+      longest_pause_seconds?: number | null;
+      response_completed_within_limit: boolean | null;
+      screen_direction_percentage?: number | null;
+      notes: string[];
+    } | null;
   }>;
   assessment: {
     overall_interview_score: number;
@@ -466,6 +478,49 @@ export async function getInterviewByMatch(matchId: string): Promise<{
     key_observations: string[];
     areas_to_probe: string[];
   } | null;
+  video_analysis_status: "pending" | "processing" | "completed" | "failed" | "unavailable";
+  video_analysis: {
+    video_analysis_status: "pending" | "processing" | "completed" | "failed" | "unavailable";
+    video_observations: {
+      recording_quality: {
+        video_available: boolean;
+        audio_available: boolean;
+        face_visible_percentage: number | null;
+        multiple_faces_detected: boolean | null;
+        lighting: "good" | "acceptable" | "poor" | "unknown";
+        framing: "good" | "acceptable" | "poor" | "unknown";
+        audio_clarity: "good" | "acceptable" | "poor" | "unknown";
+        background_noise: "low" | "moderate" | "high" | "unknown";
+      };
+      delivery_observations: {
+        speaking_time_seconds: number | null;
+        estimated_words_per_minute: number | null;
+        filler_word_count: number | null;
+        long_pause_count: number | null;
+        longest_pause_seconds: number | null;
+        response_completed_within_limit: boolean | null;
+        screen_direction_percentage: number | null;
+      };
+      technical_observations: string[];
+      neutral_summary: string;
+    };
+    per_response_observations?: Array<{
+      question_index: number;
+      question?: string;
+      transcript?: string;
+      video_observations: {
+        face_visible_percentage: number | null;
+        speaking_time_seconds: number | null;
+        filler_word_count: number | null;
+        long_pause_count: number | null;
+        longest_pause_seconds?: number | null;
+        response_completed_within_limit: boolean | null;
+        screen_direction_percentage?: number | null;
+        notes: string[];
+      };
+    }>;
+  } | null;
+  cv_consistency?: unknown;
   expires_at: string;
   created_at: string;
 }> {

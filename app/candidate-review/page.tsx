@@ -29,17 +29,7 @@ import {
 } from "@/src/lib/utils";
 
 type Disposition = "" | "Willing" | "Not Willing" | "No Show / Disappeared";
-type InterviewResult = Awaited<ReturnType<typeof getInterviewByMatch>> & {
-  video_analysis: {
-    confidence_score: number;
-    eye_contact: string;
-    presentation: string;
-    body_language: string;
-    communication_clarity: string;
-    engagement_over_time: string;
-    flags: string[];
-  } | null;
-};
+type InterviewResult = Awaited<ReturnType<typeof getInterviewByMatch>>;
 
 type FeedbackRow = {
   action: string;
@@ -844,10 +834,17 @@ function InterviewResultsModal({
 }) {
   const assessment = result.assessment;
   const responses = result.responses ?? [];
+  const profileScore = result.profile_match_score;
+  const interviewScore = assessment?.overall_interview_score ?? null;
+  const combinedScore =
+    typeof profileScore === "number" && typeof interviewScore === "number"
+      ? Math.round(profileScore * 0.6 + interviewScore * 0.4)
+      : null;
+  const videoStatus = result.video_analysis_status ?? result.video_analysis?.video_analysis_status ?? "pending";
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6">
-      <div className="relative max-h-[88vh] w-full max-w-[920px] overflow-y-auto rounded-[8px] bg-white p-7 shadow-2xl">
+      <div className="relative max-h-[88vh] w-full max-w-[980px] overflow-y-auto rounded-[8px] bg-white p-7 shadow-2xl">
         <button
           aria-label="Close interview results"
           className="absolute right-5 top-4 text-[28px] leading-none text-[#77777a] hover:text-[#333438]"
@@ -866,24 +863,40 @@ function InterviewResultsModal({
         </div>
 
         <div className="mt-6 space-y-6">
+          <section className="grid gap-4 md:grid-cols-3">
+            <ScoreSummaryCard
+              caption="Original semantic profile similarity."
+              label="Profile Match"
+              score={profileScore}
+            />
+            <ScoreSummaryCard
+              caption="Answer quality based on question responses."
+              label="Interview Answer Assessment"
+              score={interviewScore}
+            />
+            <ScoreSummaryCard
+              caption="Display-only blend: 60% profile, 40% interview. Video observations are excluded."
+              label="Combined Profile/Interview"
+              score={combinedScore}
+            />
+          </section>
+
           {assessment ? (
-            <div className="rounded-[8px] border border-[#E5E7EB] bg-[#f9fafb] p-5">
-              <p className="text-[13px] font-bold uppercase text-[#77777a]">Overall Score</p>
-              <p className={`mt-2 text-[44px] font-bold ${scoreTextColor(assessment.overall_interview_score)}`}>
-                {assessment.overall_interview_score}/100
-              </p>
+            <section className="rounded-[8px] border border-[#E5E7EB] bg-[#f9fafb] p-5">
+              <p className="text-[13px] font-bold uppercase text-[#77777a]">Interview Answer Assessment</p>
               <p className="mt-3 text-[15px] leading-7 text-[#555b66]">{assessment.summary}</p>
-            </div>
+            </section>
           ) : null}
 
           <section>
-            <h3 className="mb-3 text-[18px] font-bold text-[#333438]">Q&A Transcript</h3>
+            <h3 className="mb-3 text-[18px] font-bold text-[#333438]">Questions, Transcripts, and Feedback</h3>
             {responses.length > 0 ? (
               <div className="space-y-4">
                 {responses.map((response) => {
                   const answerAssessment = assessment?.answer_assessments.find(
                     (item) => item.question_index === response.question_index,
                   );
+                  const responseVideo = response.video_observations;
 
                   return (
                     <div
@@ -898,9 +911,33 @@ function InterviewResultsModal({
                       <div className="rounded-[8px] bg-[#f3f4f6] p-3 pr-24 text-[14px] font-bold text-[#333438]">
                         {response.question}
                       </div>
-                      <p className="mt-3 text-[14px] leading-6 text-[#555b66]">{response.transcript}</p>
+                      <p className="mt-3 text-[14px] leading-6 text-[#555b66]">
+                        {response.transcript || <span className="italic text-[#9ca0a8]">No transcript recorded.</span>}
+                      </p>
                       {answerAssessment?.comment ? (
                         <p className="mt-3 text-[13px] italic text-[#77777a]">{answerAssessment.comment}</p>
+                      ) : null}
+                      {response.video_url ? (
+                        <video className="mt-4 w-full rounded-[8px] border border-[#E5E7EB]" controls src={response.video_url} />
+                      ) : null}
+                      {responseVideo ? (
+                        <div className="mt-4 rounded-[8px] bg-[#f9fafb] p-3">
+                          <p className="text-[12px] font-bold uppercase tracking-[0.08em] text-[#77777a]">
+                            Per-Response Video Observations
+                          </p>
+                          <div className="mt-3 grid gap-2 text-[13px] text-[#555b66] sm:grid-cols-3">
+                            <ObservationMetric label="Visible" value={formatMaybePercent(responseVideo.face_visible_percentage)} />
+                            <ObservationMetric label="Filler words" value={formatMaybeValue(responseVideo.filler_word_count)} />
+                            <ObservationMetric label="Long pauses" value={formatMaybeValue(responseVideo.long_pause_count)} />
+                          </div>
+                          {responseVideo.notes?.length ? (
+                            <ul className="mt-3 space-y-1 text-[13px] leading-5 text-[#555b66]">
+                              {responseVideo.notes.map((note) => (
+                                <li key={note}>- {note}</li>
+                              ))}
+                            </ul>
+                          ) : null}
+                        </div>
                       ) : null}
                     </div>
                   );
@@ -913,30 +950,7 @@ function InterviewResultsModal({
             )}
           </section>
 
-          {result.video_analysis ? (
-            <section className="rounded-[8px] border border-[#E5E7EB] p-4">
-              <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-                <h3 className="text-[18px] font-bold text-[#333438]">Presentation Analysis</h3>
-                <Badge tone={scoreTone(result.video_analysis.confidence_score)}>
-                  {result.video_analysis.confidence_score}/100
-                </Badge>
-              </div>
-              <div className="space-y-3">
-                {[
-                  ["Eye Contact", result.video_analysis.eye_contact],
-                  ["Presentation", result.video_analysis.presentation],
-                  ["Body Language", result.video_analysis.body_language],
-                  ["Communication", result.video_analysis.communication_clarity],
-                  ["Engagement", result.video_analysis.engagement_over_time],
-                ].map(([label, value]) => (
-                  <div className="rounded-[8px] bg-[#f9fafb] px-4 py-3" key={label}>
-                    <p className="text-[13px] font-bold text-[#333438]">{label}</p>
-                    <p className="mt-1 text-[14px] leading-6 text-[#555b66]">{value}</p>
-                  </div>
-                ))}
-              </div>
-            </section>
-          ) : null}
+          <VideoObservationsSection analysis={result.video_analysis} status={videoStatus} />
 
           {!assessment ? (
             <div className="rounded-[8px] border border-[#f7d06b] bg-[#fffbeb] p-4 text-[14px] font-bold text-[#a65f00]">
@@ -957,26 +971,167 @@ function InterviewResultsModal({
           )}
         </div>
 
-        <div className="mt-7 flex flex-wrap items-center justify-end gap-3 border-t border-[#E5E7EB] pt-5">
-          <Button
-            className="mr-auto border-[#d8dee7] text-[#555b66] hover:bg-[#f9fafb]"
-            isLoading={isRefreshing}
-            onClick={onRefresh}
-            size="sm"
-            variant="secondary"
-          >
-            {"\u21bb"} Refresh Results
-          </Button>
-          <Button isLoading={isSaving === "uplift"} onClick={onProceed}>
-            Proceed to Next Stage
-          </Button>
-          <Button isLoading={isSaving === "reject"} onClick={onReject} variant="danger">
-            Reject
-          </Button>
+        <div className="mt-7 border-t border-[#E5E7EB] pt-5">
+          <div className="mb-4 rounded-[8px] bg-[#f9fafb] p-4">
+            <p className="text-[13px] font-bold uppercase tracking-[0.1em] text-[#77777a]">Recruiter Decision</p>
+            <p className="mt-2 text-[14px] leading-6 text-[#555b66]">
+              Video observations are assistive context only. Proceeding or rejecting remains a manual recruiter action.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-3">
+            <Button
+              className="mr-auto border-[#d8dee7] text-[#555b66] hover:bg-[#f9fafb]"
+              isLoading={isRefreshing}
+              onClick={onRefresh}
+              size="sm"
+              variant="secondary"
+            >
+              {"\u21bb"} Refresh Results
+            </Button>
+            <Button isLoading={isSaving === "uplift"} onClick={onProceed}>
+              Proceed to Next Stage
+            </Button>
+            <Button isLoading={isSaving === "reject"} onClick={onReject} variant="danger">
+              Reject
+            </Button>
+          </div>
         </div>
       </div>
     </div>
   );
+}
+
+function ScoreSummaryCard({ caption, label, score }: { caption: string; label: string; score: number | null }) {
+  return (
+    <div className="rounded-[8px] border border-[#E5E7EB] bg-white p-4">
+      <p className="text-[12px] font-bold uppercase tracking-[0.08em] text-[#77777a]">{label}</p>
+      <p className={`mt-3 text-[32px] font-bold ${typeof score === "number" ? scoreTextColor(score) : "text-[#77777a]"}`}>
+        {typeof score === "number" ? `${score}/100` : "Pending"}
+      </p>
+      <p className="mt-2 text-[13px] leading-5 text-[#77777a]">{caption}</p>
+    </div>
+  );
+}
+
+function VideoObservationsSection({
+  analysis,
+  status,
+}: {
+  analysis: InterviewResult["video_analysis"];
+  status: InterviewResult["video_analysis_status"];
+}) {
+  const observations = analysis?.video_observations;
+  const quality = observations?.recording_quality;
+  const delivery = observations?.delivery_observations;
+  const processing = status === "pending" || status === "processing";
+
+  return (
+    <section className="rounded-[8px] border border-[#E5E7EB] p-4">
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h3 className="text-[18px] font-bold text-[#333438]">Video Observations</h3>
+          <p className="mt-2 max-w-3xl rounded-[8px] border border-[#d8dee7] bg-[#f9fafb] p-3 text-[13px] leading-5 text-[#555b66]">
+            Video observations describe recording and presentation signals only. They do not determine honesty,
+            personality, emotional state, or candidate suitability. The recruiter must make the final decision.
+          </p>
+        </div>
+        <Badge tone={videoStatusTone(status)}>{statusLabel(status)}</Badge>
+      </div>
+
+      {processing ? (
+        <div className="rounded-[8px] border border-[#f7d06b] bg-[#fffbeb] p-4 text-[14px] font-bold text-[#a65f00]">
+          Video observations are still being processed.
+        </div>
+      ) : observations ? (
+        <div className="space-y-4">
+          <div className="grid gap-3 md:grid-cols-2">
+            <ObservationMetric label="Recording availability" value={quality?.video_available ? "Video available" : "Video unavailable"} />
+            <ObservationMetric label="Audio availability" value={quality?.audio_available ? "Audio available" : "Audio unavailable"} />
+            <ObservationMetric label="Candidate visible" value={formatMaybePercent(quality?.face_visible_percentage)} />
+            <ObservationMetric label="Multiple faces" value={formatBoolean(quality?.multiple_faces_detected)} />
+            <ObservationMetric label="Lighting" value={quality?.lighting ?? "unknown"} />
+            <ObservationMetric label="Framing" value={quality?.framing ?? "unknown"} />
+            <ObservationMetric label="Audio clarity" value={quality?.audio_clarity ?? "unknown"} />
+            <ObservationMetric label="Background noise" value={quality?.background_noise ?? "unknown"} />
+            <ObservationMetric label="Speaking time" value={formatSeconds(delivery?.speaking_time_seconds)} />
+            <ObservationMetric label="Speech-rate estimate" value={formatWpm(delivery?.estimated_words_per_minute)} />
+            <ObservationMetric label="Filler-word count" value={formatMaybeValue(delivery?.filler_word_count)} />
+            <ObservationMetric label="Long-pause count" value={formatMaybeValue(delivery?.long_pause_count)} />
+            <ObservationMetric label="Within 30 seconds" value={formatBoolean(delivery?.response_completed_within_limit)} />
+            <ObservationMetric label="Mainly toward screen" value={formatMaybePercent(delivery?.screen_direction_percentage)} />
+          </div>
+
+          {observations.neutral_summary ? (
+            <div className="rounded-[8px] bg-[#f9fafb] px-4 py-3">
+              <p className="text-[13px] font-bold text-[#333438]">Neutral Summary</p>
+              <p className="mt-1 text-[14px] leading-6 text-[#555b66]">{observations.neutral_summary}</p>
+            </div>
+          ) : null}
+
+          <ResultList title="Technical and Delivery Observations" items={observations.technical_observations ?? []} />
+        </div>
+      ) : (
+        <div className="rounded-[8px] border border-[#E5E7EB] bg-[#f9fafb] p-4 text-[14px] text-[#77777a]">
+          Video observations are not available for this interview.
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ObservationMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-[8px] bg-[#f9fafb] px-4 py-3">
+      <p className="text-[12px] font-bold uppercase tracking-[0.06em] text-[#77777a]">{label}</p>
+      <p className="mt-1 text-[14px] font-semibold text-[#333438]">{value}</p>
+    </div>
+  );
+}
+
+function formatMaybeValue(value?: number | null) {
+  return typeof value === "number" ? String(value) : "unknown";
+}
+
+function formatMaybePercent(value?: number | null) {
+  return typeof value === "number" ? `${value}%` : "unknown";
+}
+
+function formatSeconds(value?: number | null) {
+  return typeof value === "number" ? `${value}s` : "unknown";
+}
+
+function formatWpm(value?: number | null) {
+  return typeof value === "number" ? `${value} wpm` : "unknown";
+}
+
+function formatBoolean(value?: boolean | null) {
+  if (value === true) {
+    return "Yes";
+  }
+  if (value === false) {
+    return "No";
+  }
+  return "unknown";
+}
+
+function statusLabel(status: string) {
+  return status.charAt(0).toUpperCase() + status.slice(1);
+}
+
+function videoStatusTone(status: string): "green" | "amber" | "red" | "grey" | "blue" {
+  switch (status) {
+    case "completed":
+      return "green";
+    case "processing":
+    case "pending":
+      return "amber";
+    case "failed":
+      return "red";
+    case "unavailable":
+      return "grey";
+    default:
+      return "blue";
+  }
 }
 
 function ResultList({ items, title }: { items: string[]; title: string }) {

@@ -804,6 +804,8 @@ Example format: ["Question one?", "Question two?", "Question three?", "Question 
         "status": "Invited",
         "responses": [],
         "assessment": None,
+        "video_analysis_status": "pending",
+        "video_analysis": None,
         "scheduled_at": None,
         "expires_at": expires_at,
         "created_at": now,
@@ -864,25 +866,43 @@ async def get_interview_by_match(match_id: str):
     )
     if not interview:
         raise HTTPException(404, "No interview found for this match")
+
+    match = await matches_collection.find_one({"_id": ObjectId(match_id)})
+    profile_match_score = None
+    if match and match.get("match_score") is not None:
+        profile_match_score = round(match.get("match_score", 0) * 100)
+
+    video_analysis = interview.get("video_analysis")
+    video_analysis_status = (
+        interview.get("video_analysis_status")
+        or (video_analysis or {}).get("video_analysis_status")
+        or ("completed" if video_analysis else "pending")
+    )
+
     return {
         "interview_id": str(interview["_id"]),
         "candidate_name": interview["candidate_name"],
         "candidate_email": interview["candidate_email"],
         "job_title": interview["job_title"],
         "status": interview["status"],
-        "questions": interview["questions"],
-        "time_per_question_seconds": interview.get("time_per_question_seconds", 30),
+        "profile_match_score": profile_match_score,
+        "questions": interview.get("questions", []),
         "responses": [
             {
                 "question_index": r.get("question_index"),
                 "question": r.get("question"),
                 "transcript": r.get("transcript"),
                 "submitted_at": r.get("submitted_at"),
+                "video_observations": r.get("video_observations"),
+                "video_url": r.get("video_url"),
                 # deliberately exclude frames_b64 - too large for API response
             }
             for r in interview.get("responses", [])
         ],
         "assessment": interview.get("assessment"),
+        "video_analysis_status": video_analysis_status,
+        "video_analysis": video_analysis,
+        "cv_consistency": interview.get("cv_consistency"),
         "expires_at": interview["expires_at"].isoformat(),
         "created_at": interview["created_at"].isoformat(),
     }
@@ -987,6 +1007,7 @@ async def submit_response(token: str, audio: UploadFile = File(...)):
         {"$set": {
             "responses": new_responses,
             "status": "Completed" if all_done else "Started",
+            "video_analysis_status": "pending",
         }}
     )
 
@@ -1167,14 +1188,258 @@ def extract_video_frames(video_path: str, num_frames: int = 6) -> list[str]:
         return []
 
 
+
+VIDEO_QUALITY_VALUES = {"good", "acceptable", "poor", "unknown"}
+VIDEO_NOISE_VALUES = {"low", "moderate", "high", "unknown"}
+VIDEO_ANALYSIS_STATUSES = {"pending", "processing", "completed", "failed", "unavailable"}
+FILLER_WORDS = {"um", "uh", "erm", "ah", "like"}
+FILLER_PHRASES = ["you know", "sort of", "kind of"]
+PROHIBITED_VIDEO_OBSERVATION_TERMS = [
+    "honest", "dishonest", "deception", "deceptive", "personality",
+    "intelligence", "mental health", "emotional state", "emotion",
+    "confident", "confidence", "nervous", "anxiety", "anxious",
+    "cultural fit", "trustworthy", "trustworthiness", "enthusiasm",
+    "disability", "ethnicity", "religion", "gender", "sexual orientation",
+    "age", "health", "socioeconomic", "suitability",
+]
+
+
+def strip_json_fences(raw: str) -> str:
+    value = (raw or "").strip()
+    if value.startswith("```"):
+        value = value.split("```", 2)[1]
+        if value.strip().lower().startswith("json"):
+            value = value.strip()[4:]
+    return value.strip()
+
+
+def count_filler_words(transcript: str) -> int:
+    lower = (transcript or "").lower()
+    phrase_count = sum(len(re.findall(rf"\b{re.escape(phrase)}\b", lower)) for phrase in FILLER_PHRASES)
+    words = re.findall(r"\b[a-z']+\b", lower)
+    word_count = sum(1 for word in words if word in FILLER_WORDS)
+    return phrase_count + word_count
+
+
+def clamp_percentage(value):
+    if value is None:
+        return None
+    try:
+        return max(0, min(100, round(float(value))))
+    except (TypeError, ValueError):
+        return None
+
+
+def optional_number(value):
+    if value is None:
+        return None
+    try:
+        return round(float(value), 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def optional_int(value):
+    if value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def safe_quality(value) -> str:
+    normalized = str(value or "unknown").lower().strip()
+    return normalized if normalized in VIDEO_QUALITY_VALUES else "unknown"
+
+
+def safe_noise(value) -> str:
+    normalized = str(value or "unknown").lower().strip()
+    return normalized if normalized in VIDEO_NOISE_VALUES else "unknown"
+
+
+def contains_prohibited_video_observation_term(value: str) -> bool:
+    lower = str(value or "").lower()
+    for term in PROHIBITED_VIDEO_OBSERVATION_TERMS:
+        pattern = r"\b" + re.escape(term) + r"\b"
+        if re.search(pattern, lower):
+            return True
+    return False
+
+
+def sanitize_video_observation_text(value: str) -> str:
+    text_value = str(value or "").strip()
+    if contains_prohibited_video_observation_term(text_value):
+        return "Observation removed because it used unsupported inference language."
+    return text_value
+
+
+def sanitize_video_observation_list(values) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    cleaned = []
+    for value in values:
+        if value is None:
+            continue
+        cleaned_value = sanitize_video_observation_text(str(value))
+        if cleaned_value:
+            cleaned.append(cleaned_value)
+    return cleaned
+
+
+def base_response_video_observations(response: dict) -> dict:
+    transcript = response.get("transcript") or ""
+    return {
+        "face_visible_percentage": None,
+        "speaking_time_seconds": None,
+        "filler_word_count": count_filler_words(transcript),
+        "long_pause_count": None,
+        "longest_pause_seconds": None,
+        "response_completed_within_limit": True,
+        "screen_direction_percentage": None,
+        "notes": [],
+    }
+
+
+def build_unavailable_video_analysis(reason: str, responses: list[dict], status: str = "unavailable") -> dict:
+    per_response = [
+        {
+            "question_index": response.get("question_index"),
+            "question": response.get("question"),
+            "transcript": response.get("transcript"),
+            "video_observations": base_response_video_observations(response),
+        }
+        for response in responses
+    ]
+    filler_total = sum(item["video_observations"].get("filler_word_count") or 0 for item in per_response)
+    safe_reason = sanitize_video_observation_text(reason)
+    return {
+        "video_analysis_status": status if status in VIDEO_ANALYSIS_STATUSES else "unavailable",
+        "video_observations": {
+            "recording_quality": {
+                "video_available": False,
+                "audio_available": any((response.get("transcript") or "").strip() for response in responses),
+                "face_visible_percentage": None,
+                "multiple_faces_detected": None,
+                "lighting": "unknown",
+                "framing": "unknown",
+                "audio_clarity": "unknown",
+                "background_noise": "unknown",
+            },
+            "delivery_observations": {
+                "speaking_time_seconds": None,
+                "estimated_words_per_minute": None,
+                "filler_word_count": filler_total,
+                "long_pause_count": None,
+                "longest_pause_seconds": None,
+                "response_completed_within_limit": True if responses else None,
+                "screen_direction_percentage": None,
+            },
+            "technical_observations": [safe_reason] if safe_reason else [],
+            "neutral_summary": safe_reason or "Video observations are not available.",
+        },
+        "per_response_observations": per_response,
+    }
+
+
+def normalize_video_analysis_payload(raw_analysis: dict, responses: list[dict]) -> dict:
+    raw_analysis = raw_analysis if isinstance(raw_analysis, dict) else {}
+    raw_observations = raw_analysis.get("video_observations") or {}
+    raw_quality = raw_observations.get("recording_quality") or {}
+    raw_delivery = raw_observations.get("delivery_observations") or {}
+    raw_per_response = raw_analysis.get("per_response_observations") or []
+
+    response_defaults = {
+        response.get("question_index"): base_response_video_observations(response)
+        for response in responses
+    }
+    response_lookup = {
+        response.get("question_index"): response
+        for response in responses
+    }
+
+    per_response = []
+    for response in responses:
+        question_index = response.get("question_index")
+        raw_item = next(
+            (
+                item for item in raw_per_response
+                if isinstance(item, dict) and item.get("question_index") == question_index
+            ),
+            {},
+        )
+        raw_video = raw_item.get("video_observations") if isinstance(raw_item, dict) else {}
+        raw_video = raw_video or {}
+        defaults = response_defaults.get(question_index) or base_response_video_observations(response)
+        video_observations = {
+            "face_visible_percentage": clamp_percentage(raw_video.get("face_visible_percentage")),
+            "speaking_time_seconds": optional_number(raw_video.get("speaking_time_seconds")),
+            "filler_word_count": optional_int(raw_video.get("filler_word_count")) if raw_video.get("filler_word_count") is not None else defaults["filler_word_count"],
+            "long_pause_count": optional_int(raw_video.get("long_pause_count")),
+            "longest_pause_seconds": optional_number(raw_video.get("longest_pause_seconds")),
+            "response_completed_within_limit": raw_video.get("response_completed_within_limit") if isinstance(raw_video.get("response_completed_within_limit"), bool) else True,
+            "screen_direction_percentage": clamp_percentage(raw_video.get("screen_direction_percentage")),
+            "notes": sanitize_video_observation_list(raw_video.get("notes")),
+        }
+        per_response.append({
+            "question_index": question_index,
+            "question": response_lookup.get(question_index, {}).get("question"),
+            "transcript": response_lookup.get(question_index, {}).get("transcript"),
+            "video_observations": video_observations,
+        })
+
+    filler_total = sum(item["video_observations"].get("filler_word_count") or 0 for item in per_response)
+    return {
+        "video_analysis_status": "completed",
+        "video_observations": {
+            "recording_quality": {
+                "video_available": bool(raw_quality.get("video_available", True)),
+                "audio_available": bool(raw_quality.get("audio_available", any((r.get("transcript") or "").strip() for r in responses))),
+                "face_visible_percentage": clamp_percentage(raw_quality.get("face_visible_percentage")),
+                "multiple_faces_detected": raw_quality.get("multiple_faces_detected") if isinstance(raw_quality.get("multiple_faces_detected"), bool) else None,
+                "lighting": safe_quality(raw_quality.get("lighting")),
+                "framing": safe_quality(raw_quality.get("framing")),
+                "audio_clarity": safe_quality(raw_quality.get("audio_clarity")),
+                "background_noise": safe_noise(raw_quality.get("background_noise")),
+            },
+            "delivery_observations": {
+                "speaking_time_seconds": optional_number(raw_delivery.get("speaking_time_seconds")),
+                "estimated_words_per_minute": optional_int(raw_delivery.get("estimated_words_per_minute")),
+                "filler_word_count": optional_int(raw_delivery.get("filler_word_count")) if raw_delivery.get("filler_word_count") is not None else filler_total,
+                "long_pause_count": optional_int(raw_delivery.get("long_pause_count")),
+                "longest_pause_seconds": optional_number(raw_delivery.get("longest_pause_seconds")),
+                "response_completed_within_limit": raw_delivery.get("response_completed_within_limit") if isinstance(raw_delivery.get("response_completed_within_limit"), bool) else True,
+                "screen_direction_percentage": clamp_percentage(raw_delivery.get("screen_direction_percentage")),
+            },
+            "technical_observations": sanitize_video_observation_list(raw_observations.get("technical_observations")),
+            "neutral_summary": sanitize_video_observation_text(raw_observations.get("neutral_summary") or "Video observations completed."),
+        },
+        "per_response_observations": per_response,
+    }
+
+
+def apply_video_observations_to_responses(responses: list[dict], video_analysis: dict) -> list[dict]:
+    observations_by_index = {
+        item.get("question_index"): item.get("video_observations")
+        for item in video_analysis.get("per_response_observations", [])
+        if isinstance(item, dict)
+    }
+    updated = []
+    for response in responses:
+        next_response = dict(response)
+        next_response["video_observations"] = observations_by_index.get(
+            response.get("question_index"),
+            base_response_video_observations(response),
+        )
+        updated.append(next_response)
+    return updated
+
+
 @app.post("/interviews/{token}/assess-video")
 async def assess_interview_with_video(token: str):
     """
-    Full assessment including video analysis and CV consistency check.
-    Runs three GPT calls:
-    1. Standard answer quality assessment (same as assess_interview)
-    2. Video/presentation analysis using GPT-4o Vision on extracted frames
-    3. CV consistency check - does what they said match their CV claims?
+    Full assessment including answer quality, safe video observations, and CV consistency.
+    Video observations are assistive only and never change recruitment status or score.
     """
     interview = await interviews_collection.find_one({"token": token})
     if not interview:
@@ -1182,116 +1447,200 @@ async def assess_interview_with_video(token: str):
     if interview["status"] not in ("Completed", "Assessed"):
         raise HTTPException(400, "Interview not yet completed")
 
+    if interview.get("video_analysis_status") == "processing":
+        return {
+            "message": "Video observations are still processing",
+            "assessment": interview.get("assessment"),
+            "video_analysis": interview.get("video_analysis"),
+            "video_analysis_status": "processing",
+            "cv_consistency": interview.get("cv_consistency"),
+        }
+
+    if interview.get("assessment") and interview.get("video_analysis_status") in ("completed", "failed", "unavailable"):
+        return {
+            "message": "Already assessed",
+            "assessment": interview.get("assessment"),
+            "video_analysis": interview.get("video_analysis"),
+            "video_analysis_status": interview.get("video_analysis_status"),
+            "cv_consistency": interview.get("cv_consistency"),
+        }
+
+    await interviews_collection.update_one(
+        {"token": token},
+        {"$set": {"video_analysis_status": "processing"}}
+    )
+
     job = await jobs_collection.find_one({"_id": interview["job_id"]})
     candidate = await candidates_collection.find_one({"_id": interview["candidate_id"]})
     responses = interview.get("responses", [])
 
-    # --- GPT Call 1: Answer quality (same as assess_interview) ---
     qa_text = "\n\n".join([
-        f"Q{i+1}: {r['question']}\nA: {r['transcript']}"
+        f"Q{i+1}: {r['question']}\nA: {r.get('transcript', '')}"
         for i, r in enumerate(responses)
     ])
 
-    quality_prompt = f"""You are an experienced recruitment interviewer reviewing a candidate's responses.
+    assessment = interview.get("assessment")
+    if not assessment:
+        quality_prompt = f"""You are an experienced recruitment interviewer reviewing a candidate's responses.
 
 Job: {interview['job_title']}
 Required skills: {', '.join((job or {}).get('required_skills', []))}
 Candidate: {interview['candidate_name']}
+Interview format: 30 seconds per answer.
 
 Interview transcript:
 {qa_text}
 
-Assess the responses objectively. Do not make a hiring decision - present facts only.
+Assess answer relevance and evidence objectively. Do not make a hiring decision. Do not infer personality, emotions, honesty, protected characteristics, or cultural fit. Present job-relevant facts only.
 
 Return ONLY valid JSON:
 {{
   "overall_interview_score": <0-100>,
-  "summary": "2-3 sentence factual summary",
+  "summary": "2-3 sentence factual summary of the answers",
   "answer_assessments": [
-    {{"question_index": 0, "question": "...", "score": <0-100>, "comment": "one sentence"}}
+    {{"question_index": 0, "question": "...", "score": <0-100>, "comment": "one sentence factual answer feedback"}}
   ],
-  "key_observations": ["observation 1", "observation 2"],
-  "areas_to_probe": ["area 1", "area 2"]
+  "key_observations": ["job-relevant observation 1", "job-relevant observation 2"],
+  "areas_to_probe": ["follow-up area 1", "follow-up area 2"]
 }}"""
 
-    quality_response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": quality_prompt}],
-        temperature=0.3,
-    )
-    assessment = json.loads(quality_response.choices[0].message.content)
+        quality_response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": quality_prompt}],
+            temperature=0.3,
+        )
+        assessment = json.loads(strip_json_fences(quality_response.choices[0].message.content))
 
-    # --- GPT Call 2: Video/presentation analysis ---
-    video_analysis = None
+    all_frame_items = []
+    for response in responses:
+        frames = response.get("frames_b64", [])[:2]
+        for frame in frames:
+            if len(all_frame_items) >= 12:
+                break
+            all_frame_items.append({
+                "question_index": response.get("question_index"),
+                "question": response.get("question"),
+                "transcript": response.get("transcript", ""),
+                "frame": frame,
+            })
+        if len(all_frame_items) >= 12:
+            break
 
-    # Collect frames across all responses - up to 3 frames per response, max 12 total
-    all_frames = []
-    for r in responses:
-        frames = r.get("frames_b64", [])
-        all_frames.extend(frames[:3])
-
-    frames_available = all_frames[:12]
-
-    if frames_available:
-        vision_messages = [
+    if not all_frame_items:
+        video_analysis = build_unavailable_video_analysis(
+            "No sampled video frames were available for neutral presentation observations.",
+            responses,
+            status="unavailable",
+        )
+    else:
+        content = [
             {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"""You are assessing a candidate's video interview presentation.
+                "type": "text",
+                "text": f"""You are reviewing sampled frames from a recorded 30-second-per-question video interview.
+
 Candidate: {interview['candidate_name']}
 Role: {interview['job_title']}
-Interview format: Rapid-fire round, 30 seconds per question ({len(responses)} questions total)
+Responses: {len(responses)}
 
-The following images are frames sampled throughout the candidate's interview responses,
-showing their presentation across the full duration of the interview.
-Assess their professional presentation objectively based on what you observe.
+SAFETY RULES:
+- Report only directly observable recording, delivery, and technical signals.
+- Do not infer or mention honesty, deception, personality, intelligence, emotion, mental health, internal confidence, nervousness, anxiety, cultural fit, trustworthiness, enthusiasm, protected traits, or suitability for employment based on appearance.
+- Do not use facial-expression emotion recognition.
+- Do not create a behaviour score.
+- Do not include video observations in hiring recommendations.
+- Use neutral language and supporting evidence.
 
-Return ONLY valid JSON:
+Allowed observations include face visibility, multiple faces, moving out of frame, framing, lighting, background noise if evident, visible interruptions or technical issues, approximate screen direction, whether the answer appears relevant based on transcript, and transcript-derived filler words.
+Use null or "unknown" when a value cannot be measured reliably.
+
+Transcript by question:
+{qa_text}
+
+Return ONLY valid JSON in this exact shape:
 {{
-  "confidence_score": <0-100>,
-  "eye_contact": "brief observation about eye contact consistency across frames",
-  "presentation": "brief observation about professional appearance and environment",
-  "body_language": "brief observation about posture and engagement over time",
-  "communication_clarity": "brief observation about how they presented themselves",
-  "engagement_over_time": "did they maintain energy and focus throughout, or did it drop?",
-  "flags": ["specific concern worth noting, or empty array if none"]
-}}
-
-Be factual and brief. Do not make character judgements."""
-                    }
-                ] + [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{frame}",
-                            "detail": "low"
-                        }
-                    }
-                    for frame in frames_available
-                ]
+  "video_analysis_status": "completed",
+  "video_observations": {{
+    "recording_quality": {{
+      "video_available": true,
+      "audio_available": true,
+      "face_visible_percentage": <0-100 or null>,
+      "multiple_faces_detected": <true|false|null>,
+      "lighting": "good | acceptable | poor | unknown",
+      "framing": "good | acceptable | poor | unknown",
+      "audio_clarity": "good | acceptable | poor | unknown",
+      "background_noise": "low | moderate | high | unknown"
+    }},
+    "delivery_observations": {{
+      "speaking_time_seconds": <number or null>,
+      "estimated_words_per_minute": <number or null>,
+      "filler_word_count": <number or null>,
+      "long_pause_count": <number or null>,
+      "longest_pause_seconds": <number or null>,
+      "response_completed_within_limit": <true|false|null>,
+      "screen_direction_percentage": <0-100 or null>
+    }},
+    "technical_observations": ["neutral observable note"],
+    "neutral_summary": "neutral factual summary"
+  }},
+  "per_response_observations": [
+    {{
+      "question_index": 0,
+      "video_observations": {{
+        "face_visible_percentage": <0-100 or null>,
+        "speaking_time_seconds": <number or null>,
+        "filler_word_count": <number or null>,
+        "long_pause_count": <number or null>,
+        "longest_pause_seconds": <number or null>,
+        "response_completed_within_limit": true,
+        "screen_direction_percentage": <0-100 or null>,
+        "notes": ["neutral observable note"]
+      }}
+    }}
+  ]
+}}""",
             }
         ]
+
+        for item in all_frame_items:
+            content.append({
+                "type": "text",
+                "text": f"Question {item['question_index'] + 1}: {item['question']}\nTranscript: {item['transcript'][:500]}",
+            })
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{item['frame']}",
+                    "detail": "low",
+                },
+            })
 
         try:
             vision_response = client.chat.completions.create(
                 model="gpt-4o",
-                messages=vision_messages,
-                max_tokens=500,
+                messages=[{"role": "user", "content": content}],
+                max_tokens=900,
+                temperature=0.1,
             )
-            video_analysis = json.loads(vision_response.choices[0].message.content)
+            raw_video_analysis = json.loads(strip_json_fences(vision_response.choices[0].message.content))
+            video_analysis = normalize_video_analysis_payload(raw_video_analysis, responses)
         except Exception as e:
             print(f"[video analysis] Failed: {e}")
-            video_analysis = {"error": "Video analysis could not be completed"}
+            video_analysis = build_unavailable_video_analysis(
+                "Video observations could not be completed because processing failed.",
+                responses,
+                status="failed",
+            )
 
-    # --- GPT Call 3: CV consistency check ---
-    cv_raw = candidate.get("cv_raw", "") if candidate else ""
-    cand_skills = candidate.get("skills", []) if candidate else []
-    cand_years = candidate.get("years_experience", 0) if candidate else 0
-    cand_summary = candidate.get("summary", "") if candidate else ""
+    updated_responses = apply_video_observations_to_responses(responses, video_analysis)
 
-    consistency_prompt = f"""You are checking whether a candidate's interview answers
+    cv_consistency = interview.get("cv_consistency")
+    if not cv_consistency:
+        cv_raw = candidate.get("cv_raw", "") if candidate else ""
+        cand_skills = candidate.get("skills", []) if candidate else []
+        cand_years = candidate.get("years_experience", 0) if candidate else 0
+        cand_summary = candidate.get("summary", "") if candidate else ""
+
+        consistency_prompt = f"""You are checking whether a candidate's interview answers
 are consistent with their CV claims.
 
 CV SUMMARY: {cand_summary}
@@ -1304,10 +1653,10 @@ INTERVIEW TRANSCRIPT:
 
 Compare what the candidate said in the interview against what their CV claims.
 Look for:
-- Skills they claimed on CV but couldn't demonstrate knowledge of in the interview
-- Experience levels that seem inconsistent (CV says 5 years, answers suggest much less)
-- Specific projects or roles mentioned in CV that weren't mentioned or contradicted in interview
-- Positive consistency: CV claims they verified convincingly in their answers
+- Skills they claimed on CV but could not demonstrate knowledge of in the interview
+- Experience levels that appear inconsistent based on answer evidence
+- Specific projects or roles mentioned in CV that were contradicted in interview
+- Positive consistency: CV claims they supported in their answers
 
 IMPORTANT: Be fair and balanced. A candidate may not mention everything from their CV
 in a short interview. Only flag genuine inconsistencies, not omissions.
@@ -1334,24 +1683,25 @@ Return ONLY valid JSON:
   ]
 }}"""
 
-    try:
-        consistency_response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": consistency_prompt}],
-            temperature=0.2,
-        )
-        cv_consistency = json.loads(consistency_response.choices[0].message.content)
-    except Exception as e:
-        print(f"[cv consistency] Failed: {e}")
-        cv_consistency = {"error": "CV consistency check could not be completed"}
+        try:
+            consistency_response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": consistency_prompt}],
+                temperature=0.2,
+            )
+            cv_consistency = json.loads(strip_json_fences(consistency_response.choices[0].message.content))
+        except Exception as e:
+            print(f"[cv consistency] Failed: {e}")
+            cv_consistency = {"error": "CV consistency check could not be completed"}
 
-    # Store all results
     now = datetime.now(timezone.utc)
     await interviews_collection.update_one(
         {"token": token},
         {"$set": {
+            "responses": updated_responses,
             "assessment": assessment,
             "video_analysis": video_analysis,
+            "video_analysis_status": video_analysis.get("video_analysis_status", "completed"),
             "cv_consistency": cv_consistency,
             "status": "Assessed",
             "assessed_at": now.isoformat(),
@@ -1367,6 +1717,7 @@ Return ONLY valid JSON:
         "message": "Full assessment complete",
         "assessment": assessment,
         "video_analysis": video_analysis,
+        "video_analysis_status": video_analysis.get("video_analysis_status", "completed"),
         "cv_consistency": cv_consistency,
     }
 

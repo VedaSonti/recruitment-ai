@@ -121,6 +121,7 @@ export default function InterviewPage() {
   const [cameraStatus, setCameraStatus] = useState<CameraStatus>("idle");
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [currentIndex, setCurrentIndex] = useState(0);
+  const [hasConsent, setHasConsent] = useState(false);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
@@ -469,7 +470,7 @@ export default function InterviewPage() {
   }
 
   if (phase === "welcome" && interview) {
-    const canBegin = cameraStatus === "ready";
+    const canBegin = cameraStatus === "ready" && hasConsent;
 
     return (
       <Screen>
@@ -510,6 +511,20 @@ export default function InterviewPage() {
               Your video answer auto-submits when time runs out.
             </p>
           </div>
+
+          <label className="mt-4 flex items-start gap-3 rounded-lg border border-gray-200 bg-white p-3 text-sm leading-6 text-gray-600">
+            <input
+              checked={hasConsent}
+              className="mt-1 h-4 w-4 accent-[#7B1111]"
+              onChange={(event) => setHasConsent(event.target.checked)}
+              type="checkbox"
+            />
+            <span>
+              This interview records audio and video for recruiter review and automated transcription.
+              Automated processing may generate neutral observations about recording quality and interview
+              delivery. It will not determine personality, emotion, honesty, or protected characteristics.
+            </span>
+          </label>
 
           <div className="mt-6 grid gap-3 sm:grid-cols-2">
             <button
