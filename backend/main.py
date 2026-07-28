@@ -152,6 +152,57 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
+def expand_skill_abbreviations(skill: str) -> str:
+    """
+    Expand common tech abbreviations before embedding.
+    Short abbreviations have weak embeddings - expanding them improves
+    semantic matching significantly.
+
+    Examples:
+      "AI/ML" -> "artificial intelligence machine learning"
+      "NLP"   -> "natural language processing"
+      "CV"    -> "computer vision"
+    """
+    expansions = {
+        "ai/ml": "artificial intelligence machine learning",
+        "ai": "artificial intelligence",
+        "ml": "machine learning",
+        "nlp": "natural language processing",
+        "cv": "computer vision",
+        "dl": "deep learning",
+        "llm": "large language model",
+        "rag": "retrieval augmented generation",
+        "rpa": "robotic process automation",
+        "etl": "extract transform load",
+        "elt": "extract load transform",
+        "bi": "business intelligence",
+        "erp": "enterprise resource planning",
+        "crm": "customer relationship management",
+        "api": "application programming interface",
+        "rest": "restful api web services",
+        "ci/cd": "continuous integration continuous deployment",
+        "devops": "development operations deployment",
+        "mlops": "machine learning operations deployment",
+        "qa": "quality assurance testing",
+        "ux": "user experience design",
+        "ui": "user interface design",
+        "saas": "software as a service cloud",
+        "paas": "platform as a service cloud",
+        "iaas": "infrastructure as a service cloud",
+        "sql": "structured query language database",
+        "nosql": "non-relational database",
+        "oop": "object oriented programming",
+        "aws": "amazon web services cloud",
+        "gcp": "google cloud platform",
+        "azure": "microsoft azure cloud",
+        "k8s": "kubernetes container orchestration",
+        "tf": "tensorflow machine learning",
+        "pytorch": "pytorch deep learning framework",
+        "llms": "large language models generative ai",
+    }
+    lower = skill.lower().strip()
+    return expansions.get(lower, skill)
+
 def build_vector_search_pipeline(query_vector: list[float], result_limit: int) -> list[dict]:
     limit = max(1, result_limit)
     return [
@@ -275,13 +326,46 @@ async def analyse_match(match_id: str):
     # Calculate tech match %
     tech_match = round((len(matched_skills) / len(job_skills) * 100)) if job_skills else 0
 
-    # Calculate experience match %
+    # Calculate experience match - combines years and domain relevance
     if job_years == 0:
-        exp_match = 100
+        years_score = 100
     elif cand_years >= job_years:
-        exp_match = 100
+        years_score = 100
     else:
-        exp_match = round((cand_years / job_years) * 100)
+        years_score = round((cand_years / job_years) * 100)
+
+    # Domain relevance - does the candidate's domain experience match the job domain?
+    job_domain = (job.get("domain") or "").lower()
+    cand_domains = [d.lower() for d in candidate.get("domain_experience", [])]
+    job_title_lower = (job.get("title") or "").lower()
+    cand_summary_lower = (candidate.get("summary") or "").lower()
+
+    # Check domain overlap - embed and compare for semantic match
+    domain_score = 50  # default: partial match assumed
+
+    if job_domain and cand_domains:
+        try:
+            # Embed job domain against candidate domains
+            domain_texts = [job_domain] + cand_domains
+            domain_embeds = client.embeddings.create(
+                model=EMBED_MODEL, input=domain_texts
+            )
+            domain_vecs = [r.embedding for r in domain_embeds.data]
+            job_domain_vec = domain_vecs[0]
+            cand_domain_vecs = domain_vecs[1:]
+
+            best_domain_sim = max(
+                cosine_similarity(job_domain_vec, cv)
+                for cv in cand_domain_vecs
+            )
+            domain_score = round(best_domain_sim * 100)
+        except Exception:
+            domain_score = 50
+    elif job_domain in cand_summary_lower or job_title_lower in cand_summary_lower:
+        domain_score = 75
+
+    # Final experience match: 60% weight on years, 40% weight on domain relevance
+    exp_match = round(0.60 * years_score + 0.40 * domain_score)
 
     prompt = f"""You are a senior recruitment consultant with expertise in talent assessment.
 Analyse the fit between this candidate and job, then provide a factual assessment report.
@@ -307,7 +391,7 @@ Overall Match Score: {round(match.get('match_score', 0) * 100)}%
 Technical Skills Match: {tech_match}% ({len(matched_skills)}/{len(job_skills)} required skills matched)
 Matched Skills: {', '.join(matched_skills) if matched_skills else 'None'}
 Missing Skills: {', '.join(missing_skills) if missing_skills else 'None'}
-Experience Match: {exp_match}% ({cand_years} years vs {job_years} years required)
+Experience Match: {exp_match}% ({cand_years} total years experience, {job_years} years required for this role; score combines years ({years_score}%) and domain relevance ({domain_score}%))
 
 IMPORTANT: Do not make hiring recommendations or decisions. 
 Present facts objectively. Let the recruiter decide.
@@ -396,8 +480,11 @@ async def get_skill_analysis(match_id: str):
         }
         return result
 
-    # Embed all skills in one batch call — cheaper than one call per skill
-    all_skills = job_skills + cand_skills
+    # Embed all skills in one batch call - cheaper than one call per skill
+    # Expand abbreviations before embedding for better semantic matching
+    expanded_job_skills = [expand_skill_abbreviations(s) for s in job_skills]
+    expanded_cand_skills = [expand_skill_abbreviations(s) for s in cand_skills]
+    all_skills = expanded_job_skills + expanded_cand_skills
     embed_response = client.embeddings.create(model=EMBED_MODEL, input=all_skills)
     embeddings = [r.embedding for r in embed_response.data]
 
