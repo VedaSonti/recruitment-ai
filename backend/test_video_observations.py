@@ -120,6 +120,16 @@ class VideoObservationSafetyTests(unittest.TestCase):
         self.assertEqual(quality["audio_clarity"], "good")
         self.assertEqual(quality["face_visible_percentage"], 94)
 
+    def test_stored_frames_cannot_be_reported_as_video_unavailable(self):
+        result = normalize_video_analysis_payload(
+            sample_raw(video_observations__recording_quality__video_available=False),
+            [sample_response()],
+        )
+        self.assertEqual(result["video_analysis_status"], "completed")
+        self.assertTrue(
+            result["video_observations"]["recording_quality"]["video_available"]
+        )
+
     def test_candidate_briefly_moves_out_of_frame(self):
         result = normalize_video_analysis_payload(
             sample_raw(video_observations__technical_observations=["Candidate moved partially out of frame once."]),

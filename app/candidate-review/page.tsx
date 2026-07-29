@@ -31,7 +31,9 @@ import {
 type Disposition = "" | "Willing" | "Not Willing" | "No Show / Disappeared";
 type InterviewResult = Awaited<ReturnType<typeof getInterviewByMatch>>;
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
+const API_BASE_URL = (
+  process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000"
+).replace(/\/+$/, "");
 
 function resolveMediaUrl(url?: string | null) {
   if (!url) {
@@ -937,9 +939,16 @@ function InterviewResultsModal({
                           controls
                           src={resolveMediaUrl(response.video_url) ?? undefined}
                         />
-                      ) : response.video_available ? (
+                      ) : response.video_playback_status === "historical_unavailable" ? (
                         <p className="mt-4 rounded-[8px] border border-[#E5E7EB] bg-[#f9fafb] p-3 text-[13px] text-[#77777a]">
-                          Video playback is unavailable for this historical response.
+                          Video playback is unavailable for this historical response because it was
+                          recorded before persistent video storage was enabled. The deleted temporary
+                          recording cannot be recovered.
+                        </p>
+                      ) : response.video_playback_status === "missing" ? (
+                        <p className="mt-4 rounded-[8px] border border-[#f7d06b] bg-[#fffbeb] p-3 text-[13px] text-[#a65f00]">
+                          This response was recorded, but its stored video file is missing. The
+                          transcript remains available.
                         </p>
                       ) : null}
                       {responseVideo ? (

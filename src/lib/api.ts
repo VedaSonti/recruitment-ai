@@ -456,6 +456,7 @@ export async function getInterviewByMatch(matchId: string): Promise<{
     submitted_at: string;
     video_url?: string | null;
     video_available?: boolean;
+    video_playback_status?: "available" | "missing" | "historical_unavailable" | "not_recorded";
     video_size_bytes?: number | null;
     video_duration_seconds?: number | null;
     video_content_type?: string | null;
