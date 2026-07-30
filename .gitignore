@@ -8,3 +8,4 @@ out/
 
 # Candidate interview recordings are local runtime data and must never be committed.
 backend/media/
+tmp/

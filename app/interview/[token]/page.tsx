@@ -1,6 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactEventHandler,
+  type ReactNode,
+  type RefCallback,
+} from "react";
 import { useParams } from "next/navigation";
 import {
   AlertCircle,
@@ -20,11 +28,7 @@ const VIDEO_MIME_TYPES = [
   "video/webm",
 ];
 const VIDEO_CONSTRAINTS: MediaStreamConstraints = {
-  video: {
-    facingMode: "user",
-    width: { ideal: 1280 },
-    height: { ideal: 720 },
-  },
+  video: true,
   audio: true,
 };
 
@@ -67,6 +71,18 @@ function isStreamUsable(stream: MediaStream | null) {
     stream.getVideoTracks().some((track) => track.readyState === "live") &&
     stream.getAudioTracks().some((track) => track.readyState === "live")
   );
+}
+
+function logMediaTrackStatus(stream: MediaStream) {
+  stream.getTracks().forEach((track) => {
+    console.info("[camera] Track status", {
+      kind: track.kind,
+      label: track.label,
+      enabled: track.enabled,
+      muted: track.muted,
+      readyState: track.readyState,
+    });
+  });
 }
 
 function getPreferredVideoMimeType() {
@@ -129,17 +145,56 @@ export default function InterviewPage() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const mediaRequestRef = useRef<Promise<MediaStream> | null>(null);
+  const isMountedRef = useRef(true);
 
-  const attachStreamToVideo = useCallback((stream: MediaStream | null) => {
-    if (!videoRef.current) {
+  const attachStreamToVideo = useCallback(async (stream: MediaStream | null) => {
+    const videoElement = videoRef.current;
+    if (!videoElement) {
+      console.debug("[camera] Preview element is not mounted yet");
       return;
     }
 
-    videoRef.current.srcObject = stream;
-    if (stream) {
-      void videoRef.current.play().catch(() => undefined);
+    if (videoElement.srcObject !== stream) {
+      videoRef.current!.srcObject = stream;
+      console.info("[camera] MediaStream attached to preview element");
+    }
+
+    if (!stream || !videoElement.paused) {
+      return;
+    }
+
+    try {
+      const playPromise = videoElement.play();
+      if (playPromise) {
+        await playPromise;
+      }
+      console.info("[camera] Live preview playback started");
+    } catch (playbackError) {
+      console.error("[camera] Live preview playback failed", playbackError);
+      const message =
+        "Camera access was granted, but the live preview could not start. Please try enabling the camera again.";
+      if (
+        isMountedRef.current &&
+        videoRef.current === videoElement &&
+        videoElement.srcObject === stream
+      ) {
+        setCameraStatus("error");
+        setCameraError(message);
+      }
+      throw new Error(message);
     }
   }, []);
+
+  const setVideoElement = useCallback<RefCallback<HTMLVideoElement>>(
+    (element) => {
+      videoRef.current = element;
+      if (element && streamRef.current) {
+        void attachStreamToVideo(streamRef.current).catch(() => undefined);
+      }
+    },
+    [attachStreamToVideo],
+  );
 
   const stopTimer = useCallback(() => {
     if (timerRef.current) {
@@ -148,40 +203,72 @@ export default function InterviewPage() {
     }
   }, []);
 
-  const stopStream = useCallback(() => {
-    streamRef.current?.getTracks().forEach((track) => track.stop());
+  const stopStream = useCallback((reason = "camera disabled") => {
+    const stream = streamRef.current;
+    if (stream) {
+      console.info(`[camera] Stopping media tracks: ${reason}`);
+      stream.getTracks().forEach((track) => track.stop());
+    }
     streamRef.current = null;
-    attachStreamToVideo(null);
-    setCameraStatus("idle");
+    void attachStreamToVideo(null);
+    if (isMountedRef.current) {
+      setCameraStatus("idle");
+    }
   }, [attachStreamToVideo]);
 
   const ensureMediaStream = useCallback(async () => {
     if (isStreamUsable(streamRef.current)) {
-      attachStreamToVideo(streamRef.current);
+      await attachStreamToVideo(streamRef.current);
       setCameraStatus("ready");
       setCameraError("");
       return streamRef.current as MediaStream;
     }
 
+    if (mediaRequestRef.current) {
+      return mediaRequestRef.current;
+    }
+
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
-    attachStreamToVideo(null);
+    void attachStreamToVideo(null);
     setCameraStatus("checking");
     setCameraError("");
 
+    console.info("[camera] Requesting camera and microphone permission", VIDEO_CONSTRAINTS);
+    const request = navigator.mediaDevices.getUserMedia(VIDEO_CONSTRAINTS);
+    mediaRequestRef.current = request;
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia(VIDEO_CONSTRAINTS);
+      const stream = await request;
+      console.info("[camera] MediaStream received", {
+        id: stream.id,
+        videoTracks: stream.getVideoTracks().length,
+        audioTracks: stream.getAudioTracks().length,
+      });
+      logMediaTrackStatus(stream);
+
+      if (!isMountedRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        throw new Error("The camera request completed after leaving the interview page.");
+      }
+
       streamRef.current = stream;
-      attachStreamToVideo(stream);
+      await attachStreamToVideo(stream);
       setCameraStatus("ready");
       return stream;
     } catch (accessError) {
+      streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
-      attachStreamToVideo(null);
-      setCameraStatus("error");
+      void attachStreamToVideo(null);
       const message = getMediaAccessErrorMessage(accessError);
-      setCameraError(message);
+      if (isMountedRef.current) {
+        setCameraStatus("error");
+        setCameraError(message);
+      }
+      console.error("[camera] Camera and microphone setup failed", accessError);
       throw new Error(message);
+    } finally {
+      mediaRequestRef.current = null;
     }
   }, [attachStreamToVideo]);
 
@@ -230,13 +317,15 @@ export default function InterviewPage() {
   }, [fetchInterview]);
 
   useEffect(() => {
-    attachStreamToVideo(streamRef.current);
+    void attachStreamToVideo(streamRef.current).catch(() => undefined);
   }, [attachStreamToVideo, phase]);
 
   useEffect(() => {
+    isMountedRef.current = true;
     return () => {
+      isMountedRef.current = false;
       stopTimer();
-      stopStream();
+      stopStream("leaving interview page");
       audioRef.current?.pause();
     };
   }, [stopStream, stopTimer]);
@@ -272,6 +361,7 @@ export default function InterviewPage() {
             fetch(`${BASE_URL}/interviews/${encodeURIComponent(token)}/assess-video`, {
               method: "POST",
             }).catch(() => undefined);
+            stopStream("interview completed");
             setPhase("complete");
             return;
           }
@@ -295,13 +385,14 @@ export default function InterviewPage() {
           return;
         } catch {
           if (attempt === 3) {
+            stopStream("video submission failed");
             setError("Failed to submit your video answer. Please check your connection and try again.");
             setPhase("error");
           }
         }
       }
     },
-    [currentIndex, token],
+    [currentIndex, stopStream, token],
   );
 
   const stopRecording = useCallback(() => {
@@ -309,7 +400,6 @@ export default function InterviewPage() {
 
     const recorder = mediaRecorderRef.current;
     if (!recorder || recorder.state === "inactive") {
-      stopStream();
       return;
     }
 
@@ -317,12 +407,11 @@ export default function InterviewPage() {
       const mimeType = recorder.mimeType || getPreferredVideoMimeType() || "video/webm";
       const blob = new Blob(chunksRef.current, { type: mimeType });
       mediaRecorderRef.current = null;
-      stopStream();
       submitRecording(blob);
     };
 
     recorder.stop();
-  }, [stopStream, stopTimer, submitRecording]);
+  }, [stopTimer, submitRecording]);
 
   const startRecording = useCallback(async () => {
     try {
@@ -499,8 +588,15 @@ export default function InterviewPage() {
           <div className="mt-5">
             <CameraPreview
               error={cameraError}
+              onLoadedMetadata={(event) => {
+                console.info("[camera] Preview metadata loaded", {
+                  width: event.currentTarget.videoWidth,
+                  height: event.currentTarget.videoHeight,
+                  readyState: event.currentTarget.readyState,
+                });
+              }}
               status={cameraStatus}
-              videoRef={videoRef}
+              videoRef={setVideoElement}
             />
           </div>
 
@@ -586,8 +682,15 @@ export default function InterviewPage() {
           <CameraPreview
             className="shadow-sm"
             error={cameraError}
+            onLoadedMetadata={(event) => {
+              console.info("[camera] Preview metadata loaded", {
+                width: event.currentTarget.videoWidth,
+                height: event.currentTarget.videoHeight,
+                readyState: event.currentTarget.readyState,
+              });
+            }}
             status={cameraStatus}
-            videoRef={videoRef}
+            videoRef={setVideoElement}
           />
 
           {phase === "playing" ? (
@@ -660,13 +763,15 @@ export default function InterviewPage() {
 function CameraPreview({
   className = "",
   error,
+  onLoadedMetadata,
   status,
   videoRef,
 }: {
   className?: string;
   error?: string;
+  onLoadedMetadata: ReactEventHandler<HTMLVideoElement>;
   status: CameraStatus;
-  videoRef: RefObject<HTMLVideoElement>;
+  videoRef: RefCallback<HTMLVideoElement>;
 }) {
   const showOverlay = status !== "ready";
 
@@ -676,6 +781,7 @@ function CameraPreview({
         autoPlay
         className="aspect-video w-full object-cover"
         muted
+        onLoadedMetadata={onLoadedMetadata}
         playsInline
         ref={videoRef}
       />
