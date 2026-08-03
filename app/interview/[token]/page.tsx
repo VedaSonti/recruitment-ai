@@ -22,6 +22,7 @@ import {
 
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 const MAX_RECORDING_SECONDS = 30;
+const VIDEO_FRAME_TIMEOUT_MS = 5000;
 const VIDEO_MIME_TYPES = [
   "video/webm;codecs=vp9,opus",
   "video/webm;codecs=vp8,opus",
@@ -43,6 +44,8 @@ type Phase =
   | "expired";
 
 type CameraStatus = "idle" | "checking" | "ready" | "error";
+type QuestionAudioStatus = "idle" | "loading" | "playing" | "error";
+type RecordingStartTrigger = "audio-ended" | "manual-fallback";
 
 interface InterviewData {
   candidate_name: string;
@@ -82,6 +85,100 @@ function logMediaTrackStatus(stream: MediaStream) {
       muted: track.muted,
       readyState: track.readyState,
     });
+  });
+}
+
+function clearQuestionAudioHandlers(audio: HTMLAudioElement) {
+  audio.onloadstart = null;
+  audio.onloadedmetadata = null;
+  audio.oncanplay = null;
+  audio.onplay = null;
+  audio.onplaying = null;
+  audio.onvolumechange = null;
+  audio.onended = null;
+  audio.onpause = null;
+  audio.onerror = null;
+  audio.onabort = null;
+  audio.onstalled = null;
+}
+
+function mediaLogTime() {
+  return {
+    timestamp: new Date().toISOString(),
+    performanceMs: Math.round(performance.now()),
+  };
+}
+
+function waitForVideoFrames(
+  videoElement: HTMLVideoElement,
+  stream: MediaStream,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const cleanup = () => {
+      window.clearTimeout(timeoutId);
+      frameEvents.forEach((eventName) => {
+        videoElement.removeEventListener(eventName, handleFrameEvent);
+      });
+      videoElement.removeEventListener("error", handleFatalEvent);
+      videoElement.removeEventListener("stalled", handleFatalEvent);
+    };
+
+    const hasVisibleFrames = () => {
+      const videoTrack = stream.getVideoTracks()[0];
+      return (
+        stream.active &&
+        Boolean(videoTrack) &&
+        videoTrack.readyState === "live" &&
+        videoElement.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+        videoElement.videoWidth > 0 &&
+        videoElement.videoHeight > 0
+      );
+    };
+
+    const finish = (callback: () => void) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      callback();
+    };
+
+    const handleFrameEvent = () => {
+      if (hasVisibleFrames()) {
+        finish(resolve);
+      }
+    };
+
+    const handleFatalEvent = (event: Event) => {
+      const mediaError = videoElement.error;
+      finish(() => {
+        reject(
+          new Error(
+            mediaError
+              ? `Camera preview failed with media error code ${mediaError.code}.`
+              : `Camera preview emitted a ${event.type} event before frames were available.`,
+          ),
+        );
+      });
+    };
+
+    const frameEvents = ["loadedmetadata", "loadeddata", "canplay", "playing"] as const;
+    frameEvents.forEach((eventName) => {
+      videoElement.addEventListener(eventName, handleFrameEvent);
+    });
+    videoElement.addEventListener("error", handleFatalEvent);
+    videoElement.addEventListener("stalled", handleFatalEvent);
+
+    const timeoutId = window.setTimeout(() => {
+      finish(() => {
+        reject(new Error("Camera preview did not produce visible frames within 5 seconds."));
+      });
+    }, VIDEO_FRAME_TIMEOUT_MS);
+
+    handleFrameEvent();
   });
 }
 
@@ -135,6 +232,9 @@ export default function InterviewPage() {
   const [error, setError] = useState("");
   const [cameraError, setCameraError] = useState("");
   const [cameraStatus, setCameraStatus] = useState<CameraStatus>("idle");
+  const [questionAudioError, setQuestionAudioError] = useState("");
+  const [questionAudioStatus, setQuestionAudioStatus] =
+    useState<QuestionAudioStatus>("idle");
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [hasConsent, setHasConsent] = useState(false);
@@ -143,16 +243,35 @@ export default function InterviewPage() {
   const chunksRef = useRef<BlobPart[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const questionAudioObjectUrlRef = useRef<string | null>(null);
+  const audioSessionIdRef = useRef(0);
+  const audioPlaybackCompletedSessionRef = useRef<number | null>(null);
+  const manualAudioFallbackSessionRef = useRef<number | null>(null);
+  const recordingStartRequestedRef = useRef(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const mediaRequestRef = useRef<Promise<MediaStream> | null>(null);
+  const videoAttachmentIdRef = useRef(0);
   const isMountedRef = useRef(true);
 
   const attachStreamToVideo = useCallback(async (stream: MediaStream | null) => {
+    const attachmentId = ++videoAttachmentIdRef.current;
     const videoElement = videoRef.current;
     if (!videoElement) {
-      console.debug("[camera] Preview element is not mounted yet");
+      if (stream) {
+        throw new Error("Camera preview element is not mounted.");
+      }
       return;
+    }
+
+    if (!stream) {
+      videoElement.srcObject = null;
+      return;
+    }
+
+    const videoTrack = stream.getVideoTracks()[0];
+    if (!stream.active || !videoTrack || videoTrack.readyState !== "live") {
+      throw new Error("Camera stream does not contain an active live video track.");
     }
 
     if (videoElement.srcObject !== stream) {
@@ -160,41 +279,37 @@ export default function InterviewPage() {
       console.info("[camera] MediaStream attached to preview element");
     }
 
-    if (!stream || !videoElement.paused) {
-      return;
+    if (videoElement.paused) {
+      await videoElement.play();
+      console.info("[camera] Live preview playback started");
     }
 
     try {
-      const playPromise = videoElement.play();
-      if (playPromise) {
-        await playPromise;
+      await waitForVideoFrames(videoElement, stream);
+    } catch (frameError) {
+      if (attachmentId !== videoAttachmentIdRef.current) {
+        return;
       }
-      console.info("[camera] Live preview playback started");
-    } catch (playbackError) {
-      console.error("[camera] Live preview playback failed", playbackError);
-      const message =
-        "Camera access was granted, but the live preview could not start. Please try enabling the camera again.";
-      if (
-        isMountedRef.current &&
-        videoRef.current === videoElement &&
-        videoElement.srcObject === stream
-      ) {
-        setCameraStatus("error");
-        setCameraError(message);
-      }
-      throw new Error(message);
+      throw frameError;
     }
-  }, []);
 
-  const setVideoElement = useCallback<RefCallback<HTMLVideoElement>>(
-    (element) => {
-      videoRef.current = element;
-      if (element && streamRef.current) {
-        void attachStreamToVideo(streamRef.current).catch(() => undefined);
-      }
-    },
-    [attachStreamToVideo],
-  );
+    if (
+      attachmentId !== videoAttachmentIdRef.current ||
+      videoRef.current !== videoElement ||
+      videoElement.srcObject !== stream
+    ) {
+      return;
+    }
+
+    console.info("[camera] Live preview frames confirmed", {
+      readyState: videoElement.readyState,
+      width: videoElement.videoWidth,
+      height: videoElement.videoHeight,
+      trackState: videoTrack.readyState,
+    });
+    setCameraError("");
+    setCameraStatus("ready");
+  }, []);
 
   const stopTimer = useCallback(() => {
     if (timerRef.current) {
@@ -216,11 +331,78 @@ export default function InterviewPage() {
     }
   }, [attachStreamToVideo]);
 
+  const releaseQuestionAudio = useCallback((reason: string) => {
+    const audio = audioRef.current;
+    if (audio) {
+      console.info("[question-audio] Releasing Audio element", {
+        reason,
+        ...mediaLogTime(),
+      });
+      clearQuestionAudioHandlers(audio);
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+      audioRef.current = null;
+    }
+
+    const objectUrl = questionAudioObjectUrlRef.current;
+    if (objectUrl) {
+      URL.revokeObjectURL(objectUrl);
+      questionAudioObjectUrlRef.current = null;
+      console.info("[question-audio] Revoked MP3 object URL", {
+        reason,
+        ...mediaLogTime(),
+      });
+    }
+  }, []);
+
+  const handleCameraAttachmentError = useCallback(
+    (attachmentError: unknown, context: string) => {
+      console.error(`[camera] ${context}`, attachmentError);
+      stopStream("fatal camera preview error");
+      if (isMountedRef.current) {
+        setCameraStatus("error");
+        setCameraError(
+          attachmentError instanceof Error && attachmentError.message
+            ? attachmentError.message
+            : "The camera stream started, but visible preview frames were not available.",
+        );
+      }
+    },
+    [stopStream],
+  );
+
+  const setVideoElement = useCallback<RefCallback<HTMLVideoElement>>(
+    (element) => {
+      const previousElement = videoRef.current;
+      videoAttachmentIdRef.current += 1;
+      videoRef.current = element;
+
+      if (!element) {
+        if (previousElement) {
+          previousElement.srcObject = null;
+        }
+        return;
+      }
+
+      const stream = streamRef.current;
+      if (stream) {
+        setCameraStatus("checking");
+        setCameraError("");
+        void attachStreamToVideo(stream).catch((attachmentError) => {
+          handleCameraAttachmentError(
+            attachmentError,
+            "Failed to attach the existing MediaStream to the new preview element.",
+          );
+        });
+      }
+    },
+    [attachStreamToVideo, handleCameraAttachmentError],
+  );
+
   const ensureMediaStream = useCallback(async () => {
     if (isStreamUsable(streamRef.current)) {
       await attachStreamToVideo(streamRef.current);
-      setCameraStatus("ready");
-      setCameraError("");
       return streamRef.current as MediaStream;
     }
 
@@ -234,7 +416,10 @@ export default function InterviewPage() {
     setCameraStatus("checking");
     setCameraError("");
 
-    console.info("[camera] Requesting camera and microphone permission", VIDEO_CONSTRAINTS);
+    console.info("[camera] Requesting camera and microphone permission", {
+      constraints: VIDEO_CONSTRAINTS,
+      ...mediaLogTime(),
+    });
     const request = navigator.mediaDevices.getUserMedia(VIDEO_CONSTRAINTS);
     mediaRequestRef.current = request;
 
@@ -244,6 +429,7 @@ export default function InterviewPage() {
         id: stream.id,
         videoTracks: stream.getVideoTracks().length,
         audioTracks: stream.getAudioTracks().length,
+        ...mediaLogTime(),
       });
       logMediaTrackStatus(stream);
 
@@ -254,7 +440,6 @@ export default function InterviewPage() {
 
       streamRef.current = stream;
       await attachStreamToVideo(stream);
-      setCameraStatus("ready");
       return stream;
     } catch (accessError) {
       streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -317,8 +502,18 @@ export default function InterviewPage() {
   }, [fetchInterview]);
 
   useEffect(() => {
-    void attachStreamToVideo(streamRef.current).catch(() => undefined);
-  }, [attachStreamToVideo, phase]);
+    const stream = streamRef.current;
+    if (!stream) {
+      return;
+    }
+
+    void attachStreamToVideo(stream).catch((attachmentError) => {
+      handleCameraAttachmentError(
+        attachmentError,
+        `Failed to restore the camera preview during the "${phase}" phase.`,
+      );
+    });
+  }, [attachStreamToVideo, handleCameraAttachmentError, phase]);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -326,9 +521,9 @@ export default function InterviewPage() {
       isMountedRef.current = false;
       stopTimer();
       stopStream("leaving interview page");
-      audioRef.current?.pause();
+      releaseQuestionAudio("leaving interview page");
     };
-  }, [stopStream, stopTimer]);
+  }, [releaseQuestionAudio, stopStream, stopTimer]);
 
   const submitRecording = useCallback(
     async (blob: Blob) => {
@@ -385,7 +580,6 @@ export default function InterviewPage() {
           return;
         } catch {
           if (attempt === 3) {
-            stopStream("video submission failed");
             setError("Failed to submit your video answer. Please check your connection and try again.");
             setPhase("error");
           }
@@ -413,9 +607,94 @@ export default function InterviewPage() {
     recorder.stop();
   }, [stopTimer, submitRecording]);
 
-  const startRecording = useCallback(async () => {
+  const startRecording = useCallback(async (
+    trigger: RecordingStartTrigger,
+    audioSessionId: number,
+  ) => {
+    if (audioSessionId !== audioSessionIdRef.current) {
+      console.warn("[recording] Ignoring stale recording request", {
+        audioSessionId,
+        currentAudioSessionId: audioSessionIdRef.current,
+        trigger,
+        ...mediaLogTime(),
+      });
+      return;
+    }
+
+    const playbackCompleted =
+      audioPlaybackCompletedSessionRef.current === audioSessionId;
+    const manualFallbackSelected =
+      trigger === "manual-fallback" &&
+      manualAudioFallbackSessionRef.current === audioSessionId;
+
+    if (!playbackCompleted && !manualFallbackSelected) {
+      const sequencingError = new Error(
+        "MediaRecorder start was requested before the current question audio ended.",
+      );
+      console.error("[recording] Blocked early recording start", {
+        audioSessionId,
+        trigger,
+        playbackCompleted,
+        manualFallbackSelected,
+        ...mediaLogTime(),
+      });
+      if (process.env.NODE_ENV !== "production") {
+        throw sequencingError;
+      }
+      return;
+    }
+
+    if (recordingStartRequestedRef.current) {
+      console.warn("[recording] Ignoring duplicate recording request", {
+        audioSessionId,
+        trigger,
+        ...mediaLogTime(),
+      });
+      return;
+    }
+
+    const existingRecorder = mediaRecorderRef.current;
+    if (existingRecorder && existingRecorder.state !== "inactive") {
+      console.error("[recording] Refusing to replace an active MediaRecorder", {
+        audioSessionId,
+        recorderState: existingRecorder.state,
+        trigger,
+        ...mediaLogTime(),
+      });
+      return;
+    }
+
+    if (timerRef.current) {
+      console.error("[recording] Refusing to start while the recording timer is active", {
+        audioSessionId,
+        trigger,
+        ...mediaLogTime(),
+      });
+      return;
+    }
+
+    recordingStartRequestedRef.current = true;
+    console.info("[recording] start requested", {
+      audioSessionId,
+      trigger,
+      ...mediaLogTime(),
+    });
+
     try {
       const stream = await ensureMediaStream();
+
+      if (
+        audioSessionId !== audioSessionIdRef.current ||
+        !recordingStartRequestedRef.current
+      ) {
+        console.warn("[recording] Recording request became stale during media setup", {
+          audioSessionId,
+          currentAudioSessionId: audioSessionIdRef.current,
+          ...mediaLogTime(),
+        });
+        return;
+      }
+
       const recorder = createVideoRecorder(stream);
 
       chunksRef.current = [];
@@ -429,12 +708,19 @@ export default function InterviewPage() {
 
       recorder.onerror = () => {
         stopTimer();
-        stopStream();
+        stopStream("fatal MediaRecorder error");
         setError("Video recording failed. Please refresh and try the interview again.");
         setPhase("error");
       };
 
       recorder.start();
+      console.info("[recording] MediaRecorder started", {
+        audioSessionId,
+        mimeType: recorder.mimeType,
+        state: recorder.state,
+        streamId: stream.id,
+        ...mediaLogTime(),
+      });
       setRecordingSeconds(0);
       setPhase("recording");
 
@@ -449,8 +735,9 @@ export default function InterviewPage() {
         });
       }, 1000);
     } catch (accessError) {
+      recordingStartRequestedRef.current = false;
       stopTimer();
-      stopStream();
+      stopStream("fatal recording setup error");
       setError(getMediaAccessErrorMessage(accessError));
       setPhase("error");
     }
@@ -458,35 +745,328 @@ export default function InterviewPage() {
 
   const playQuestion = useCallback(
     async (index: number) => {
+      const audioSessionId = ++audioSessionIdRef.current;
+      audioPlaybackCompletedSessionRef.current = null;
+      manualAudioFallbackSessionRef.current = null;
+      recordingStartRequestedRef.current = false;
+
       if (!token) {
         return;
       }
 
+      const recorder = mediaRecorderRef.current;
+      if (
+        (recorder && recorder.state !== "inactive") ||
+        timerRef.current
+      ) {
+        console.error("[question-audio] Refusing to play while recording is active", {
+          audioSessionId,
+          recorderState: recorder?.state ?? null,
+          timerActive: Boolean(timerRef.current),
+          ...mediaLogTime(),
+        });
+        return;
+      }
+
       try {
-        await ensureMediaStream();
+        if (!isStreamUsable(streamRef.current)) {
+          await ensureMediaStream();
+        }
       } catch (accessError) {
-        stopStream();
+        stopStream("fatal camera setup error");
         setError(getMediaAccessErrorMessage(accessError));
         setPhase("error");
         return;
       }
 
       setPhase("playing");
+      setQuestionAudioError("");
+      setQuestionAudioStatus("loading");
+      releaseQuestionAudio("starting or replaying a question");
+
+      const audioUrl =
+        `${BASE_URL}/interviews/${encodeURIComponent(token)}/question-audio/${index}`;
+      console.info("[question-audio] fetch started", {
+        audioSessionId,
+        index,
+        url: audioUrl,
+        ...mediaLogTime(),
+      });
+
+      let response: Response;
+      let audioBlob: Blob;
+      try {
+        response = await fetch(audioUrl);
+        audioBlob = await response.blob();
+
+        if (audioSessionId !== audioSessionIdRef.current) {
+          console.info("[question-audio] Ignoring stale fetch completion", {
+            audioSessionId,
+            currentAudioSessionId: audioSessionIdRef.current,
+            index,
+            ...mediaLogTime(),
+          });
+          return;
+        }
+
+        console.info("[question-audio] fetch completed", {
+          audioSessionId,
+          index,
+          url: audioUrl,
+          status: response.status,
+          ok: response.ok,
+          contentType: response.headers.get("content-type"),
+          contentLength: response.headers.get("content-length"),
+          blobType: audioBlob.type,
+          blobSize: audioBlob.size,
+          ...mediaLogTime(),
+        });
+
+        if (!response.ok) {
+          throw new Error(`Question audio request failed with status ${response.status}.`);
+        }
+        if (audioBlob.size === 0) {
+          throw new Error("Question audio response was empty.");
+        }
+
+        const contentType = response.headers.get("content-type") ?? audioBlob.type;
+        if (!contentType.toLowerCase().startsWith("audio/")) {
+          throw new Error(
+            `Question audio response had unexpected content type "${contentType || "missing"}".`,
+          );
+        }
+      } catch (fetchError) {
+        if (audioSessionId !== audioSessionIdRef.current) {
+          return;
+        }
+        console.error("[question-audio] MP3 fetch failed", {
+          audioSessionId,
+          index,
+          url: audioUrl,
+          error: fetchError,
+          ...mediaLogTime(),
+        });
+        setQuestionAudioStatus("error");
+        setQuestionAudioError(
+          "The interview question could not be loaded. Check your connection, then replay the question.",
+        );
+        return;
+      }
+
+      if (
+        !isMountedRef.current ||
+        audioSessionId !== audioSessionIdRef.current
+      ) {
+        return;
+      }
+
+      const objectUrl = URL.createObjectURL(audioBlob);
+      questionAudioObjectUrlRef.current = objectUrl;
+      const audio = new Audio();
+      audioRef.current = audio;
+      audio.preload = "auto";
+
+      const isCurrentAudioSession = () =>
+        audioSessionId === audioSessionIdRef.current &&
+        audioRef.current === audio;
+
+      const logAudioState = (eventName: string) => {
+        console.info(`[question-audio] ${eventName}`, {
+          audioSessionId,
+          index,
+          url: audioUrl,
+          muted: audio.muted,
+          volume: audio.volume,
+          readyState: audio.readyState,
+          networkState: audio.networkState,
+          currentSrc: audio.currentSrc,
+          duration: audio.duration,
+          error: audio.error
+            ? { code: audio.error.code, message: audio.error.message }
+            : null,
+          ...mediaLogTime(),
+        });
+      };
+
+      let playbackFailed = false;
+      const handlePlaybackFailure = (playbackError?: unknown) => {
+        if (playbackFailed || !isCurrentAudioSession()) {
+          return;
+        }
+
+        playbackFailed = true;
+        const mediaErrorCode = audio.error?.code;
+        console.error("[question-audio] Playback failed", {
+          audioSessionId,
+          error: playbackError,
+          mediaErrorCode,
+          url: audioUrl,
+          ...mediaLogTime(),
+        });
+        setQuestionAudioStatus("error");
+        setQuestionAudioError(
+          "The interview question could not be played. Check your speaker volume and connection, then replay the question.",
+        );
+        releaseQuestionAudio("question playback failed");
+      };
+
+      audio.onloadstart = () => {
+        if (!isCurrentAudioSession()) {
+          return;
+        }
+        logAudioState("loadstart");
+      };
+      audio.onloadedmetadata = () => {
+        if (!isCurrentAudioSession()) {
+          return;
+        }
+        logAudioState("loadedmetadata");
+        if (!Number.isFinite(audio.duration) || audio.duration <= 0) {
+          handlePlaybackFailure(
+            new Error(`Question audio duration is invalid: ${audio.duration}.`),
+          );
+        }
+      };
+      audio.oncanplay = () => {
+        if (!isCurrentAudioSession()) {
+          return;
+        }
+        logAudioState("canplay");
+      };
+      audio.onplay = () => {
+        if (!isCurrentAudioSession()) {
+          return;
+        }
+        logAudioState("play");
+      };
+      let playPromiseResolved = false;
+      let playingEventReceived = false;
+      const logPlayingEventAfterPlayResolution = () => {
+        if (
+          playPromiseResolved &&
+          playingEventReceived &&
+          isCurrentAudioSession()
+        ) {
+          logAudioState("playing event");
+          setQuestionAudioStatus("playing");
+          playingEventReceived = false;
+        }
+      };
+      audio.onplaying = () => {
+        if (!isCurrentAudioSession()) {
+          return;
+        }
+        playingEventReceived = true;
+        logPlayingEventAfterPlayResolution();
+      };
+      audio.onvolumechange = () => {
+        if (!isCurrentAudioSession()) {
+          return;
+        }
+        logAudioState("volumechange");
+      };
+      audio.onended = () => {
+        if (!isCurrentAudioSession()) {
+          return;
+        }
+
+        logAudioState("ended event");
+        audioPlaybackCompletedSessionRef.current = audioSessionId;
+        clearQuestionAudioHandlers(audio);
+        audio.removeAttribute("src");
+        audio.load();
+        audioRef.current = null;
+        if (questionAudioObjectUrlRef.current === objectUrl) {
+          URL.revokeObjectURL(objectUrl);
+          questionAudioObjectUrlRef.current = null;
+          console.info("[question-audio] Revoked completed MP3 object URL", {
+            audioSessionId,
+            index,
+            ...mediaLogTime(),
+          });
+        }
+        setQuestionAudioStatus("idle");
+        setQuestionAudioError("");
+        void startRecording("audio-ended", audioSessionId);
+      };
+      audio.onpause = () => {
+        if (!isCurrentAudioSession()) {
+          return;
+        }
+        logAudioState("pause");
+      };
+      audio.onerror = () => {
+        if (!isCurrentAudioSession()) {
+          return;
+        }
+        logAudioState("error");
+        handlePlaybackFailure(audio.error);
+      };
+      audio.onabort = () => {
+        if (!isCurrentAudioSession()) {
+          return;
+        }
+        logAudioState("abort");
+      };
+      audio.onstalled = () => {
+        if (!isCurrentAudioSession()) {
+          return;
+        }
+        logAudioState("stalled");
+      };
+
+      audio.muted = false;
+      audio.volume = 1;
+      audio.src = objectUrl;
+      audio.load();
+      logAudioState("before play()");
 
       try {
-        const audio = new Audio(
-          `${BASE_URL}/interviews/${encodeURIComponent(token)}/question-audio/${index}`,
-        );
-        audioRef.current = audio;
-        audio.onended = () => startRecording();
-        audio.onerror = () => startRecording();
+        console.info("[question-audio] play invoked", {
+          audioSessionId,
+          index,
+          url: audioUrl,
+          ...mediaLogTime(),
+        });
         await audio.play();
-      } catch {
-        startRecording();
+        if (!isCurrentAudioSession()) {
+          return;
+        }
+        playPromiseResolved = true;
+        console.info("[question-audio] play resolved", {
+          audioSessionId,
+          index,
+          url: audioUrl,
+          ...mediaLogTime(),
+        });
+        logPlayingEventAfterPlayResolution();
+      } catch (playbackError) {
+        handlePlaybackFailure(playbackError);
       }
     },
-    [ensureMediaStream, startRecording, stopStream, token],
+    [ensureMediaStream, releaseQuestionAudio, startRecording, stopStream, token],
   );
+
+  const continueWithoutQuestionAudio = useCallback(() => {
+    const audioSessionId = audioSessionIdRef.current;
+    manualAudioFallbackSessionRef.current = audioSessionId;
+    releaseQuestionAudio("candidate chose to continue without question audio");
+    console.warn("[question-audio] Candidate chose to continue without question audio", {
+      audioSessionId,
+      ...mediaLogTime(),
+    });
+    setQuestionAudioStatus("idle");
+    setQuestionAudioError("");
+    void startRecording("manual-fallback", audioSessionId);
+  }, [releaseQuestionAudio, startRecording]);
+
+  const beginInterview = useCallback(() => {
+    console.info("[question-audio] begin clicked", {
+      questionIndex: currentIndex,
+      ...mediaLogTime(),
+    });
+    void playQuestion(currentIndex);
+  }, [currentIndex, playQuestion]);
 
   const playQuestionRef = useRef(playQuestion);
 
@@ -634,7 +1214,7 @@ export default function InterviewPage() {
             <button
               className="rounded-xl bg-[#7B1111] px-5 py-3 text-lg font-semibold text-white transition hover:bg-[#6a0f0f] disabled:cursor-not-allowed disabled:bg-gray-300"
               disabled={!canBegin}
-              onClick={() => playQuestion(currentIndex)}
+              onClick={beginInterview}
               type="button"
             >
               Begin Interview
@@ -695,18 +1275,52 @@ export default function InterviewPage() {
 
           {phase === "playing" ? (
             <div className="flex flex-col items-center gap-3 py-4">
-              <div className="flex h-10 items-end gap-1">
-                {[3, 5, 7, 5, 3, 6, 4, 7, 5, 3].map((height, index) => (
-                  <div
-                    className="w-1.5 animate-pulse rounded-full bg-[#7B1111]"
-                    key={`${height}-${index}`}
-                    style={{ height: `${height * 4}px`, animationDelay: `${index * 0.1}s` }}
-                  />
-                ))}
-              </div>
-              <p className="flex items-center gap-2 text-gray-500">
-                <Volume2 size={16} /> AI is reading the question...
+              {questionAudioStatus === "error" ? (
+                <AlertCircle className="text-red-500" size={32} />
+              ) : (
+                <div className="flex h-10 items-end gap-1">
+                  {[3, 5, 7, 5, 3, 6, 4, 7, 5, 3].map((height, index) => (
+                    <div
+                      className="w-1.5 animate-pulse rounded-full bg-[#7B1111]"
+                      key={`${height}-${index}`}
+                      style={{ height: `${height * 4}px`, animationDelay: `${index * 0.1}s` }}
+                    />
+                  ))}
+                </div>
+              )}
+              <p
+                className={`flex items-center gap-2 ${
+                  questionAudioStatus === "error" ? "text-red-600" : "text-gray-500"
+                }`}
+              >
+                <Volume2 size={16} />
+                {questionAudioStatus === "loading"
+                  ? "Loading the interview question..."
+                  : questionAudioStatus === "error"
+                    ? questionAudioError
+                    : "AI is reading the question..."}
               </p>
+              <div className="flex flex-wrap justify-center gap-3">
+                <button
+                  className="rounded-lg border border-[#7B1111] px-4 py-2 text-sm font-semibold text-[#7B1111] transition hover:bg-[#fff4f4] disabled:cursor-not-allowed disabled:border-gray-200 disabled:text-gray-400"
+                  disabled={
+                    questionAudioStatus === "loading" || questionAudioStatus === "playing"
+                  }
+                  onClick={() => playQuestion(currentIndex)}
+                  type="button"
+                >
+                  Replay Question
+                </button>
+                {questionAudioStatus === "error" ? (
+                  <button
+                    className="rounded-lg bg-[#7B1111] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[#6a0f0f]"
+                    onClick={continueWithoutQuestionAudio}
+                    type="button"
+                  >
+                    Continue Without Audio
+                  </button>
+                ) : null}
+              </div>
             </div>
           ) : null}
 
