@@ -10,3 +10,4 @@ python-docx
 pypdf
 Pillow
 opencv-python
+reportlab

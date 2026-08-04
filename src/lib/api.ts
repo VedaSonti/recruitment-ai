@@ -163,6 +163,57 @@ export interface TopCandidateAnalysisResult {
   analysed: Array<{ match_id: string; analysis: DecisionAnalysis }>;
 }
 
+export interface UpliftExperience {
+  title?: string;
+  company?: string;
+  start_year?: string | number;
+  end_year?: string | number;
+  is_current?: boolean;
+  highlights?: string[];
+}
+
+export interface UpliftProfileContent {
+  name: string;
+  professional_title: string;
+  professional_summary: string;
+  core_skills: string[];
+  technical_skills: string[];
+  professional_experience: UpliftExperience[];
+  key_achievements: string[];
+  education: Education[];
+  certifications: string[];
+  contact: { email?: string; phone?: string; location?: string };
+  additional_information: { work_rights?: string; notice_period?: string };
+  section_visibility: Record<string, boolean>;
+}
+
+export interface UpliftProfile {
+  profile_id: string;
+  candidate_id: string;
+  match_id: string;
+  job_id: string;
+  interview_id?: string | null;
+  candidate_name: string;
+  target_job: string;
+  workflow_status: string;
+  uplift_status: "Ready" | "Draft" | "Generated" | "Delivered" | string;
+  profile_match_score?: number | null;
+  interview_score?: number | null;
+  combined_score?: number | null;
+  original_cv_reference: {
+    source_file?: string | null;
+    available: boolean;
+    download_url?: string | null;
+  };
+  uplifted_profile: UpliftProfileContent;
+  generated_file_reference?: string | null;
+  download_url?: string | null;
+  verified_by_recruiter_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  generated_at?: string | null;
+}
+
 export class RecruitmentAPIError extends Error implements APIError {
   status: number;
   error?: string;
@@ -532,4 +583,52 @@ export async function getInterviewByMatch(matchId: string): Promise<{
   return request(`/interviews/by-match/${encodeURIComponent(matchId)}`, {
     method: "GET",
   });
+}
+
+export function prepareProfileUplift(matchId: string): Promise<UpliftProfile> {
+  return request(`/profile-uplifting/${encodeURIComponent(matchId)}/prepare`, {
+    method: "POST",
+  });
+}
+
+export async function getProfileUplifts(): Promise<UpliftProfile[]> {
+  const response = await request<{ profiles: UpliftProfile[] }>("/profile-uplifting", {
+    method: "GET",
+  });
+  return response.profiles ?? [];
+}
+
+export function getProfileUplift(matchId: string): Promise<UpliftProfile> {
+  return request(`/profile-uplifting/${encodeURIComponent(matchId)}`, {
+    method: "GET",
+  });
+}
+
+export function saveProfileUplift(
+  matchId: string,
+  upliftedProfile: UpliftProfileContent,
+): Promise<UpliftProfile> {
+  return request(`/profile-uplifting/${encodeURIComponent(matchId)}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      uplifted_profile: upliftedProfile,
+      confirm_factual_accuracy: true,
+    }),
+  });
+}
+
+export function generateProfileUplift(matchId: string): Promise<UpliftProfile> {
+  return request(`/profile-uplifting/${encodeURIComponent(matchId)}/generate`, {
+    method: "POST",
+  });
+}
+
+export function resolveAPIUrl(path?: string | null) {
+  if (!path) {
+    return null;
+  }
+  if (/^https?:\/\//i.test(path)) {
+    return path;
+  }
+  return buildUrl(path);
 }

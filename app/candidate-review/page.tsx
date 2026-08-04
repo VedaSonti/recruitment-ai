@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { ArrowRight, CheckCircle2, Save } from "lucide-react";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { Badge } from "@/components/ui/Badge";
@@ -13,6 +14,7 @@ import {
   getJobs,
   getMatchesByJob,
   isAPIError,
+  prepareProfileUplift,
   scheduleInterview,
   updateMatchStatus,
   type Job,
@@ -82,6 +84,7 @@ const approvedStatuses = [
 ];
 
 export default function CandidateReviewPage() {
+  const router = useRouter();
   const [jobs, setJobs] = useState<Job[]>([]);
   const [selectedJobId, setSelectedJobId] = useState("");
   const [matches, setMatches] = useState<Match[]>([]);
@@ -94,6 +97,8 @@ export default function CandidateReviewPage() {
   const [showInterviewModal, setShowInterviewModal] = useState(false);
   const [activeInterviewMatchId, setActiveInterviewMatchId] = useState("");
   const [modalActionLoading, setModalActionLoading] = useState<"uplift" | "reject" | null>(null);
+  const [showProceedConfirmation, setShowProceedConfirmation] = useState(false);
+  const [proceedError, setProceedError] = useState("");
   const [isRefreshingInterview, setIsRefreshingInterview] = useState(false);
   const [toast, setToast] = useState("");
   const [isLoading, setIsLoading] = useState(true);
@@ -465,20 +470,43 @@ export default function CandidateReviewPage() {
     }
   }
 
-  async function completeFromModal(status: "Uplifted" | "Sent") {
+  async function rejectFromModal() {
     if (!activeInterviewMatchId) {
       return;
     }
 
-    setModalActionLoading(status === "Uplifted" ? "uplift" : "reject");
+    setModalActionLoading("reject");
 
     try {
-      await updateMatchStatus(activeInterviewMatchId, status);
+      await updateMatchStatus(activeInterviewMatchId, "Sent");
       patchMatch(activeInterviewMatchId, {
-        status,
+        status: "Sent",
         updated_at: new Date().toISOString(),
       });
       await closeInterviewModal();
+    } finally {
+      setModalActionLoading(null);
+    }
+  }
+
+  async function confirmProceedToUplift() {
+    if (!activeInterviewMatchId || modalActionLoading === "uplift") {
+      return;
+    }
+
+    setModalActionLoading("uplift");
+    setProceedError("");
+    try {
+      const profile = await prepareProfileUplift(activeInterviewMatchId);
+      patchMatch(activeInterviewMatchId, {
+        status: "Uplifted",
+        updated_at: new Date().toISOString(),
+      });
+      setShowProceedConfirmation(false);
+      setShowInterviewModal(false);
+      router.push(`/uplift?matchId=${encodeURIComponent(profile.match_id)}`);
+    } catch (error) {
+      setProceedError(error instanceof Error ? error.message : "Could not prepare the candidate profile.");
     } finally {
       setModalActionLoading(null);
     }
@@ -821,11 +849,50 @@ export default function CandidateReviewPage() {
           isRefreshing={isRefreshingInterview}
           isSaving={modalActionLoading}
           onClose={closeInterviewModal}
-          onProceed={() => completeFromModal("Uplifted")}
+          onProceed={() => {
+            setProceedError("");
+            setShowProceedConfirmation(true);
+          }}
           onRefresh={refreshInterviewResults}
-          onReject={() => completeFromModal("Sent")}
+          onReject={rejectFromModal}
           result={interviewResult}
         />
+      ) : null}
+
+      {showProceedConfirmation ? (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/45 p-6">
+          <div className="w-full max-w-[520px] rounded-[10px] bg-white p-7 shadow-2xl">
+            <p className="text-[12px] font-bold uppercase tracking-[0.12em] text-crimson-700">
+              Recruiter confirmation
+            </p>
+            <h2 className="mt-2 text-[23px] font-bold text-[#333438]">
+              Proceed with this candidate and prepare an iSOFT-formatted profile?
+            </h2>
+            <p className="mt-3 text-[14px] leading-6 text-[#667085]">
+              This records your manual decision and creates one draft profile from verified CV information. It does not send anything to a client.
+            </p>
+            {proceedError ? (
+              <p className="mt-4 rounded-[8px] border border-red-200 bg-red-50 p-3 text-[14px] text-red-700">
+                {proceedError}
+              </p>
+            ) : null}
+            <div className="mt-6 flex justify-end gap-3">
+              <Button
+                disabled={modalActionLoading === "uplift"}
+                onClick={() => setShowProceedConfirmation(false)}
+                variant="secondary"
+              >
+                Cancel
+              </Button>
+              <Button
+                isLoading={modalActionLoading === "uplift"}
+                onClick={confirmProceedToUplift}
+              >
+                Proceed and Prepare Profile
+              </Button>
+            </div>
+          </div>
+        </div>
       ) : null}
     </>
   );

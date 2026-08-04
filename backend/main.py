@@ -50,7 +50,14 @@ from prompts import (
     build_embedding_text_from_candidate,
 )
 from file_loader import load_text_file
-from db import jobs_collection, candidates_collection, matches_collection, interviews_collection
+from db import (
+    jobs_collection,
+    candidates_collection,
+    matches_collection,
+    generated_profiles_collection,
+    interviews_collection,
+)
+from profile_pdf import generate_profile_pdf
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -71,6 +78,22 @@ if not _configured_interview_media_root.is_absolute():
     _configured_interview_media_root = BACKEND_DIR / _configured_interview_media_root
 INTERVIEW_MEDIA_ROOT = _configured_interview_media_root.resolve()
 INTERVIEW_VIDEO_KEY_PREFIX = PurePosixPath("media/interviews")
+
+_configured_profile_media_root = Path(
+    os.getenv("PROFILE_MEDIA_ROOT", str(BACKEND_DIR / "media" / "profiles"))
+)
+if not _configured_profile_media_root.is_absolute():
+    _configured_profile_media_root = BACKEND_DIR / _configured_profile_media_root
+PROFILE_MEDIA_ROOT = _configured_profile_media_root.resolve()
+PROFILE_FILE_KEY_PREFIX = PurePosixPath("media/profiles")
+
+_configured_candidate_media_root = Path(
+    os.getenv("CANDIDATE_MEDIA_ROOT", str(BACKEND_DIR / "media" / "candidates"))
+)
+if not _configured_candidate_media_root.is_absolute():
+    _configured_candidate_media_root = BACKEND_DIR / _configured_candidate_media_root
+CANDIDATE_MEDIA_ROOT = _configured_candidate_media_root.resolve()
+CANDIDATE_FILE_KEY_PREFIX = PurePosixPath("media/candidates")
 
 CHAT_MODEL = "gpt-4o-mini"
 EMBED_MODEL = "text-embedding-3-small"
@@ -148,6 +171,63 @@ def resolve_stored_interview_video_path(response: dict) -> Optional[Path]:
         return None
 
     return video_path
+
+
+def _safe_media_path(root: Path, *parts: str) -> Optional[Path]:
+    """Resolve a controlled media path without allowing traversal."""
+    try:
+        resolved_root = root.resolve()
+        resolved_path = resolved_root.joinpath(*parts).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if resolved_root != resolved_path and resolved_root not in resolved_path.parents:
+        return None
+    return resolved_path
+
+
+def profile_pdf_storage_key(match_id: ObjectId) -> str:
+    return str(PROFILE_FILE_KEY_PREFIX / str(match_id) / "candidate-profile.pdf")
+
+
+def resolve_profile_pdf_storage_key(storage_key: str) -> Optional[Path]:
+    try:
+        key = PurePosixPath(storage_key)
+    except (TypeError, ValueError):
+        return None
+    if (
+        key.is_absolute()
+        or ".." in key.parts
+        or key.parts[:2] != PROFILE_FILE_KEY_PREFIX.parts
+        or len(key.parts) != 4
+        or not ObjectId.is_valid(key.parts[2])
+        or key.parts[3] != "candidate-profile.pdf"
+    ):
+        return None
+    return _safe_media_path(PROFILE_MEDIA_ROOT, key.parts[2], key.parts[3])
+
+
+def candidate_cv_storage_key(candidate_id: ObjectId, filename: str) -> str:
+    suffix = Path(filename or "candidate.pdf").suffix.lower()
+    if suffix not in {".pdf", ".docx"}:
+        suffix = ".bin"
+    return str(CANDIDATE_FILE_KEY_PREFIX / str(candidate_id) / f"original{suffix}")
+
+
+def resolve_candidate_cv_storage_key(storage_key: str) -> Optional[Path]:
+    try:
+        key = PurePosixPath(storage_key)
+    except (TypeError, ValueError):
+        return None
+    if (
+        key.is_absolute()
+        or ".." in key.parts
+        or key.parts[:2] != CANDIDATE_FILE_KEY_PREFIX.parts
+        or len(key.parts) != 4
+        or not ObjectId.is_valid(key.parts[2])
+        or not re.fullmatch(r"original\.(pdf|docx|bin)", key.parts[3])
+    ):
+        return None
+    return _safe_media_path(CANDIDATE_MEDIA_ROOT, key.parts[2], key.parts[3])
 
 
 def get_video_duration_seconds(video_path: str) -> Optional[float]:
@@ -594,20 +674,89 @@ async def ensure_match_uniqueness() -> None:
         unique=True,
         name="unique_job_candidate_match",
     )
+    await generated_profiles_collection.create_index(
+        [("match_id", 1)],
+        unique=True,
+        name="unique_profile_match",
+    )
 
 
-async def save_uploaded_file_to_temp(upload_file: UploadFile) -> tuple[str, str]:
-    """Save an uploaded file to a temp path and return (tmp_path, content_hash).
+def validate_upload_extension(filename: Optional[str]) -> str:
+    """Return a safe supported suffix or reject the upload before writing it."""
+    suffix = Path(filename or "").suffix.lower()
+    if suffix not in {".pdf", ".docx"}:
+        raise HTTPException(
+            status_code=415,
+            detail="Unsupported file type. Please upload a PDF or DOCX file.",
+        )
+    return suffix
+
+
+async def save_uploaded_file_to_temp(upload_file: UploadFile) -> tuple[str, str, bytes]:
+    """Return a temporary path, content hash, and unchanged upload bytes.
     The hash is an MD5 of the raw file bytes — used to detect duplicate uploads
     regardless of filename. Returned alongside the path so the caller can check
     for duplicates before doing any GPT/embedding work.
     """
-    suffix = os.path.splitext(upload_file.filename)[1]
+    suffix = validate_upload_extension(upload_file.filename)
     contents = await upload_file.read()
     content_hash = hashlib.md5(contents).hexdigest()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(contents)
-        return tmp.name, content_hash
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            tmp.write(contents)
+        return tmp_path, content_hash, contents
+    except Exception:
+        if tmp_path:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def _remove_file_best_effort(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"[candidate upload] Could not remove incomplete original CV {path}: {exc}")
+
+
+async def persist_candidate_with_original_cv(
+    candidate_doc: dict,
+    original_cv_bytes: bytes,
+    original_filename: Optional[str],
+) -> ObjectId:
+    """Store the original CV before atomically inserting its candidate reference."""
+    candidate_id = ObjectId()
+    original_cv_key = candidate_cv_storage_key(
+        candidate_id,
+        original_filename or "candidate.pdf",
+    )
+    original_cv_path = resolve_candidate_cv_storage_key(original_cv_key)
+    if not original_cv_path:
+        raise HTTPException(500, "Could not create a safe original CV storage path")
+
+    try:
+        original_cv_path.parent.mkdir(parents=True, exist_ok=True)
+        original_cv_path.write_bytes(original_cv_bytes)
+    except OSError as exc:
+        _remove_file_best_effort(original_cv_path)
+        raise HTTPException(500, "Could not safely store the original CV") from exc
+
+    candidate_with_original = {
+        **candidate_doc,
+        "_id": candidate_id,
+        "original_cv_storage_key": original_cv_key,
+    }
+    try:
+        await candidates_collection.insert_one(candidate_with_original)
+    except Exception:
+        _remove_file_best_effort(original_cv_path)
+        raise
+
+    return candidate_id
 
 
 # ---------------------------------------------------------------------------
@@ -2063,6 +2212,307 @@ async def root():
     return {"status": "Recruitment AI API is running"}
 
 
+class UpliftProfileUpdate(BaseModel):
+    uplifted_profile: dict
+    confirm_factual_accuracy: bool = False
+
+
+def _iso(value):
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
+def _profile_response(profile: dict) -> dict:
+    generated_key = profile.get("generated_file_reference")
+    original = profile.get("original_cv_reference") or {}
+    return {
+        "profile_id": str(profile["_id"]),
+        "candidate_id": str(profile["candidate_id"]),
+        "match_id": str(profile["match_id"]),
+        "job_id": str(profile["job_id"]),
+        "interview_id": str(profile["interview_id"]) if profile.get("interview_id") else None,
+        "candidate_name": profile.get("candidate_name"),
+        "target_job": profile.get("target_job"),
+        "workflow_status": profile.get("workflow_status", "Uplifted"),
+        "uplift_status": profile.get("uplift_status", "Ready"),
+        "profile_match_score": profile.get("profile_match_score"),
+        "interview_score": profile.get("interview_score"),
+        "combined_score": profile.get("combined_score"),
+        "original_cv_reference": {
+            "source_file": original.get("source_file"),
+            "available": bool(original.get("available")),
+            "download_url": (
+                f"/profile-uplifting/{profile['match_id']}/original"
+                if original.get("available")
+                else None
+            ),
+        },
+        "uplifted_profile": profile.get("uplifted_profile") or {},
+        "generated_file_reference": generated_key,
+        "download_url": (
+            f"/profile-uplifting/{profile['match_id']}/download"
+            if generated_key
+            else None
+        ),
+        "verified_by_recruiter_at": _iso(profile.get("verified_by_recruiter_at")),
+        "created_at": _iso(profile.get("created_at")),
+        "updated_at": _iso(profile.get("updated_at")),
+        "generated_at": _iso(profile.get("generated_at")),
+    }
+
+
+def _initial_uplift_profile(candidate: dict) -> dict:
+    experience = candidate.get("work_experience") or []
+    current_role = next((role for role in experience if role.get("is_current")), None)
+    current_role = current_role or (experience[0] if experience else {})
+    skills = [str(skill).strip() for skill in candidate.get("skills", []) if str(skill).strip()]
+    return {
+        "name": candidate.get("name") or "",
+        "professional_title": current_role.get("title") or "",
+        "professional_summary": candidate.get("summary") or "",
+        "core_skills": skills[:8],
+        "technical_skills": skills[8:],
+        "professional_experience": experience,
+        "key_achievements": candidate.get("key_achievements") or [],
+        "education": candidate.get("education") or [],
+        "certifications": candidate.get("certifications") or [],
+        "contact": {
+            "email": candidate.get("email") or "",
+            "phone": candidate.get("phone") or "",
+            "location": candidate.get("location") or "",
+        },
+        "additional_information": {
+            "work_rights": candidate.get("work_rights") or "",
+            "notice_period": candidate.get("notice_period") or "",
+        },
+        "section_visibility": {
+            "contact": True,
+            "summary": True,
+            "skills": True,
+            "experience": True,
+            "achievements": True,
+            "education": True,
+            "certifications": True,
+            "additional": True,
+        },
+    }
+
+
+@app.post("/profile-uplifting/{match_id}/prepare")
+async def prepare_profile_uplift(match_id: str):
+    """Idempotently initialise a verified-data profile after recruiter approval."""
+    if not ObjectId.is_valid(match_id):
+        raise HTTPException(404, "Match not found")
+    match_object_id = ObjectId(match_id)
+    match = await matches_collection.find_one({"_id": match_object_id})
+    if not match:
+        raise HTTPException(404, "Match not found")
+    if match.get("status") not in {"Interview Completed", "Uplifted"}:
+        raise HTTPException(400, "Candidate must complete recruiter-reviewed interview assessment before profile uplifting")
+
+    existing_profile = await generated_profiles_collection.find_one({"match_id": match_object_id})
+    if existing_profile:
+        if match.get("status") != "Uplifted":
+            await matches_collection.update_one(
+                {"_id": match_object_id},
+                {"$set": {"status": "Uplifted", "updated_at": datetime.now(timezone.utc)}},
+            )
+        return _profile_response(existing_profile)
+
+    candidate = await candidates_collection.find_one({"_id": match["candidate_id"]})
+    job = await jobs_collection.find_one({"_id": match["job_id"]})
+    if not candidate:
+        raise HTTPException(404, "Candidate not found")
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if not (candidate.get("cv_raw") or candidate.get("work_experience") or candidate.get("summary")):
+        raise HTTPException(400, "Parsed candidate CV data is unavailable")
+
+    interview = await interviews_collection.find_one({"match_id": match_object_id})
+    assessment = (interview or {}).get("assessment") or {}
+    profile_score = round(float(match.get("match_score", 0)) * 100)
+    interview_score = assessment.get("overall_interview_score")
+    combined_score = (
+        round(profile_score * 0.6 + float(interview_score) * 0.4)
+        if isinstance(interview_score, (int, float))
+        else None
+    )
+    original_key = candidate.get("original_cv_storage_key")
+    original_path = resolve_candidate_cv_storage_key(original_key) if original_key else None
+    original_available = bool(original_path and original_path.is_file())
+    now = datetime.now(timezone.utc)
+    new_profile = {
+        "candidate_id": candidate["_id"],
+        "match_id": match_object_id,
+        "job_id": job["_id"],
+        "interview_id": interview.get("_id") if interview else None,
+        "candidate_name": candidate.get("name") or "Unknown candidate",
+        "target_job": job.get("title") or "Unknown role",
+        "workflow_status": "Uplifted",
+        "uplift_status": "Ready",
+        "profile_match_score": profile_score,
+        "interview_score": interview_score,
+        "combined_score": combined_score,
+        "original_cv_reference": {
+            "source_file": candidate.get("source_file"),
+            "storage_key": original_key,
+            "available": original_available,
+        },
+        "source_snapshot": {
+            "content_hash": candidate.get("content_hash"),
+            "cv_raw_hash": hashlib.sha256((candidate.get("cv_raw") or "").encode("utf-8")).hexdigest(),
+        },
+        "uplifted_profile": _initial_uplift_profile(candidate),
+        "generated_file_reference": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    try:
+        await generated_profiles_collection.update_one(
+            {"match_id": match_object_id},
+            {"$setOnInsert": new_profile},
+            upsert=True,
+        )
+    except DuplicateKeyError:
+        pass
+    await matches_collection.update_one(
+        {"_id": match_object_id},
+        {"$set": {"status": "Uplifted", "updated_at": now}},
+    )
+    profile = await generated_profiles_collection.find_one({"match_id": match_object_id})
+    return _profile_response(profile)
+
+
+@app.get("/profile-uplifting")
+async def list_profile_uplifts():
+    profiles = await generated_profiles_collection.find().sort("updated_at", -1).to_list(length=None)
+    return {"profiles": [_profile_response(profile) for profile in profiles]}
+
+
+@app.get("/profile-uplifting/{match_id}")
+async def get_profile_uplift(match_id: str):
+    if not ObjectId.is_valid(match_id):
+        raise HTTPException(404, "Profile not found")
+    profile = await generated_profiles_collection.find_one({"match_id": ObjectId(match_id)})
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    return _profile_response(profile)
+
+
+@app.put("/profile-uplifting/{match_id}")
+async def update_profile_uplift(match_id: str, body: UpliftProfileUpdate):
+    if not ObjectId.is_valid(match_id):
+        raise HTTPException(404, "Profile not found")
+    if not body.confirm_factual_accuracy:
+        raise HTTPException(400, "Recruiter confirmation is required before saving CV edits")
+    match_object_id = ObjectId(match_id)
+    existing = await generated_profiles_collection.find_one({"match_id": match_object_id})
+    if not existing:
+        raise HTTPException(404, "Profile not found")
+
+    current = existing.get("uplifted_profile") or {}
+    allowed = {
+        "professional_title",
+        "professional_summary",
+        "core_skills",
+        "technical_skills",
+        "professional_experience",
+        "key_achievements",
+        "education",
+        "certifications",
+        "section_visibility",
+    }
+    updated = dict(current)
+    for key in allowed:
+        if key in body.uplifted_profile:
+            updated[key] = body.uplifted_profile[key]
+    if "section_visibility" in body.uplifted_profile:
+        updated["section_visibility"] = {
+            **(current.get("section_visibility") or {}),
+            **(body.uplifted_profile.get("section_visibility") or {}),
+        }
+
+    now = datetime.now(timezone.utc)
+    await generated_profiles_collection.update_one(
+        {"match_id": match_object_id},
+        {
+            "$set": {
+                "uplifted_profile": updated,
+                "uplift_status": "Draft",
+                "verified_by_recruiter_at": now,
+                "updated_at": now,
+                "generated_file_reference": None,
+            },
+            "$unset": {"generated_at": ""},
+        },
+    )
+    profile = await generated_profiles_collection.find_one({"match_id": match_object_id})
+    return _profile_response(profile)
+
+
+@app.post("/profile-uplifting/{match_id}/generate")
+async def generate_profile_uplift(match_id: str):
+    if not ObjectId.is_valid(match_id):
+        raise HTTPException(404, "Profile not found")
+    match_object_id = ObjectId(match_id)
+    profile = await generated_profiles_collection.find_one({"match_id": match_object_id})
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    if not profile.get("verified_by_recruiter_at"):
+        raise HTTPException(400, "Save and confirm factual accuracy before generating the final CV")
+
+    storage_key = profile_pdf_storage_key(match_object_id)
+    output_path = resolve_profile_pdf_storage_key(storage_key)
+    if not output_path:
+        raise HTTPException(500, "Could not create a safe profile output path")
+    try:
+        generate_profile_pdf(profile.get("uplifted_profile") or {}, output_path)
+    except Exception as exc:
+        print(f"[profile uplifting] PDF generation failed for {match_id}: {exc}")
+        raise HTTPException(500, "Profile generation failed") from exc
+
+    now = datetime.now(timezone.utc)
+    await generated_profiles_collection.update_one(
+        {"match_id": match_object_id},
+        {"$set": {
+            "generated_file_reference": storage_key,
+            "uplift_status": "Generated",
+            "generated_at": now,
+            "updated_at": now,
+        }},
+    )
+    updated = await generated_profiles_collection.find_one({"match_id": match_object_id})
+    return _profile_response(updated)
+
+
+@app.get("/profile-uplifting/{match_id}/download")
+async def download_profile_uplift(match_id: str):
+    if not ObjectId.is_valid(match_id):
+        raise HTTPException(404, "Profile not found")
+    profile = await generated_profiles_collection.find_one({"match_id": ObjectId(match_id)})
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    output_path = resolve_profile_pdf_storage_key(profile.get("generated_file_reference"))
+    if not output_path or not output_path.is_file():
+        raise HTTPException(404, "Generated profile file is missing")
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "-", profile.get("candidate_name") or "candidate").strip("-")
+    return FileResponse(output_path, media_type="application/pdf", filename=f"{safe_name}-candidate-profile.pdf")
+
+
+@app.get("/profile-uplifting/{match_id}/original")
+async def download_original_cv(match_id: str):
+    if not ObjectId.is_valid(match_id):
+        raise HTTPException(404, "Profile not found")
+    profile = await generated_profiles_collection.find_one({"match_id": ObjectId(match_id)})
+    if not profile:
+        raise HTTPException(404, "Profile not found")
+    original = profile.get("original_cv_reference") or {}
+    original_path = resolve_candidate_cv_storage_key(original.get("storage_key"))
+    if not original_path or not original_path.is_file():
+        raise HTTPException(404, "Original CV file is unavailable for this historical candidate")
+    return FileResponse(original_path, filename=original.get("source_file") or original_path.name)
+
+
 @app.post("/jobs/upload")
 async def upload_job(
     file: UploadFile = File(...),
@@ -2076,7 +2526,7 @@ async def upload_job(
     embeds each role, stores each as its own job document in MongoDB, and
     immediately matches each new role against every existing candidate.
     """
-    tmp_path, content_hash = await save_uploaded_file_to_temp(file)
+    tmp_path, content_hash, _uploaded_bytes = await save_uploaded_file_to_temp(file)
     try:
         raw_text = load_text_file(tmp_path)
     finally:
@@ -2141,7 +2591,7 @@ async def upload_candidate(file: UploadFile = File(...)):
     candidate document in MongoDB, and immediately matches it against every
     existing job.
     """
-    tmp_path, content_hash = await save_uploaded_file_to_temp(file)
+    tmp_path, content_hash, original_cv_bytes = await save_uploaded_file_to_temp(file)
     try:
         raw_text = load_text_file(tmp_path)
     finally:
@@ -2171,8 +2621,11 @@ async def upload_candidate(file: UploadFile = File(...)):
         "cv_raw": raw_text,
         "created_at": datetime.now(timezone.utc),
     }
-    result = await candidates_collection.insert_one(candidate_doc)
-    candidate_id = result.inserted_id
+    candidate_id = await persist_candidate_with_original_cv(
+        candidate_doc,
+        original_cv_bytes,
+        file.filename,
+    )
 
     existing_job_count = await jobs_collection.count_documents({})
     top_jobs = []
