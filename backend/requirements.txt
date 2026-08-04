@@ -11,3 +11,6 @@ pypdf
 Pillow
 opencv-python
 reportlab
+argon2-cffi
+PyJWT
+email-validator

@@ -25,17 +25,14 @@ import hashlib
 import tempfile
 import io
 from pathlib import Path, PurePosixPath
-import smtplib
 import secrets
 from datetime import datetime, timezone, timedelta
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from typing import Optional
 from bson import ObjectId
 
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import Depends, FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -56,20 +53,17 @@ from db import (
     matches_collection,
     generated_profiles_collection,
     interviews_collection,
+    password_reset_tokens_collection,
+    recruiter_users_collection,
 )
+from auth import get_current_recruiter, router as auth_router
+from email_service import send_email
 from profile_pdf import generate_profile_pdf
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-EMAIL_FROM = os.getenv("EMAIL_FROM", "")
-EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "iSOFT Recruitment")
-
 BACKEND_DIR = Path(__file__).resolve().parent
 _configured_interview_media_root = Path(
     os.getenv("INTERVIEW_MEDIA_ROOT", str(BACKEND_DIR / "media" / "interviews"))
@@ -290,47 +284,6 @@ def response_video_playback(
     return None, "not_recorded"
 
 
-def send_email(to_address: str, subject: str, html_body: str) -> bool:
-    """
-    Send an email using Gmail SMTP.
-    Returns True if sent successfully, False otherwise.
-    Isolated here so switching to Resend later only requires
-    changing this function body - no other code changes needed.
-
-    TO SWITCH TO RESEND LATER: replace only this function body with:
-        import resend
-        resend.api_key = os.getenv("RESEND_API_KEY")
-        resend.Emails.send({
-            "from": f"{EMAIL_FROM_NAME} <{EMAIL_FROM}>",
-            "to": to_address,
-            "subject": subject,
-            "html": html_body,
-        })
-        return True
-    """
-    if not SMTP_USER or not SMTP_PASSWORD:
-        print("[email] SMTP credentials not configured - skipping send")
-        return False
-
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = f"{EMAIL_FROM_NAME} <{EMAIL_FROM or SMTP_USER}>"
-        msg["To"] = to_address
-        msg.attach(MIMEText(html_body, "html"))
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(EMAIL_FROM or SMTP_USER, to_address, msg.as_string())
-
-        print(f"[email] Sent '{subject}' to {to_address}")
-        return True
-    except Exception as e:
-        print(f"[email] Failed to send to {to_address}: {e}")
-        return False
-
 app = FastAPI(title="Recruitment AI API")
 app.add_middleware(
     CORSMiddleware,
@@ -344,6 +297,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(auth_router)
 
 # ---------------------------------------------------------------------------
 # Shared GPT + embedding helpers (same logic as match_core_v3.py)
@@ -679,6 +633,21 @@ async def ensure_match_uniqueness() -> None:
         unique=True,
         name="unique_profile_match",
     )
+    await recruiter_users_collection.create_index(
+        [("email_normalized", 1)],
+        unique=True,
+        name="unique_recruiter_email",
+    )
+    await password_reset_tokens_collection.create_index(
+        [("token_hash", 1)],
+        unique=True,
+        name="unique_password_reset_token",
+    )
+    await password_reset_tokens_collection.create_index(
+        [("expires_at", 1)],
+        expireAfterSeconds=0,
+        name="expire_password_reset_tokens",
+    )
 
 
 def validate_upload_extension(filename: Optional[str]) -> str:
@@ -763,7 +732,7 @@ async def persist_candidate_with_original_cv(
 # Endpoints
 # ---------------------------------------------------------------------------
 
-@app.post("/matches/{match_id}/analyse")
+@app.post("/matches/{match_id}/analyse", dependencies=[Depends(get_current_recruiter)])
 async def analyse_match(match_id: str):
     """
     Run decision intelligence analysis on a specific match.
@@ -932,7 +901,7 @@ Return ONLY valid JSON, no markdown, no code fences:
         "analysis": analysis,
     }
 
-@app.get("/matches/{match_id}/skill-analysis")
+@app.get("/matches/{match_id}/skill-analysis", dependencies=[Depends(get_current_recruiter)])
 async def get_skill_analysis(match_id: str):
     """
     Semantic skill matching using embeddings.
@@ -1008,7 +977,7 @@ async def get_skill_analysis(match_id: str):
     return result
 
 
-@app.post("/interviews/schedule/{match_id}")
+@app.post("/interviews/schedule/{match_id}", dependencies=[Depends(get_current_recruiter)])
 async def schedule_interview(match_id: str):
     """
     Schedule an AI interview for a shortlisted candidate.
@@ -1153,7 +1122,7 @@ Example format: ["Question one?", "Question two?", "Question three?", "Question 
     }
 
 
-@app.get("/interviews/by-match/{match_id}")
+@app.get("/interviews/by-match/{match_id}", dependencies=[Depends(get_current_recruiter)])
 async def get_interview_by_match(match_id: str):
     """Recruiter views interview results for a specific match."""
     if not ObjectId.is_valid(match_id):
@@ -1213,7 +1182,7 @@ async def get_interview_by_match(match_id: str):
     }
 
 
-@app.get("/interviews/by-match/{match_id}/responses/{question_index}/video")
+@app.get("/interviews/by-match/{match_id}/responses/{question_index}/video", dependencies=[Depends(get_current_recruiter)])
 async def get_interview_response_video(match_id: str, question_index: int):
     """Controlled recruiter playback endpoint for persisted interview response video."""
     if not ObjectId.is_valid(match_id):
@@ -2297,7 +2266,7 @@ def _initial_uplift_profile(candidate: dict) -> dict:
     }
 
 
-@app.post("/profile-uplifting/{match_id}/prepare")
+@app.post("/profile-uplifting/{match_id}/prepare", dependencies=[Depends(get_current_recruiter)])
 async def prepare_profile_uplift(match_id: str):
     """Idempotently initialise a verified-data profile after recruiter approval."""
     if not ObjectId.is_valid(match_id):
@@ -2383,13 +2352,13 @@ async def prepare_profile_uplift(match_id: str):
     return _profile_response(profile)
 
 
-@app.get("/profile-uplifting")
+@app.get("/profile-uplifting", dependencies=[Depends(get_current_recruiter)])
 async def list_profile_uplifts():
     profiles = await generated_profiles_collection.find().sort("updated_at", -1).to_list(length=None)
     return {"profiles": [_profile_response(profile) for profile in profiles]}
 
 
-@app.get("/profile-uplifting/{match_id}")
+@app.get("/profile-uplifting/{match_id}", dependencies=[Depends(get_current_recruiter)])
 async def get_profile_uplift(match_id: str):
     if not ObjectId.is_valid(match_id):
         raise HTTPException(404, "Profile not found")
@@ -2399,7 +2368,7 @@ async def get_profile_uplift(match_id: str):
     return _profile_response(profile)
 
 
-@app.put("/profile-uplifting/{match_id}")
+@app.put("/profile-uplifting/{match_id}", dependencies=[Depends(get_current_recruiter)])
 async def update_profile_uplift(match_id: str, body: UpliftProfileUpdate):
     if not ObjectId.is_valid(match_id):
         raise HTTPException(404, "Profile not found")
@@ -2450,7 +2419,7 @@ async def update_profile_uplift(match_id: str, body: UpliftProfileUpdate):
     return _profile_response(profile)
 
 
-@app.post("/profile-uplifting/{match_id}/generate")
+@app.post("/profile-uplifting/{match_id}/generate", dependencies=[Depends(get_current_recruiter)])
 async def generate_profile_uplift(match_id: str):
     if not ObjectId.is_valid(match_id):
         raise HTTPException(404, "Profile not found")
@@ -2485,7 +2454,7 @@ async def generate_profile_uplift(match_id: str):
     return _profile_response(updated)
 
 
-@app.get("/profile-uplifting/{match_id}/download")
+@app.get("/profile-uplifting/{match_id}/download", dependencies=[Depends(get_current_recruiter)])
 async def download_profile_uplift(match_id: str):
     if not ObjectId.is_valid(match_id):
         raise HTTPException(404, "Profile not found")
@@ -2499,7 +2468,7 @@ async def download_profile_uplift(match_id: str):
     return FileResponse(output_path, media_type="application/pdf", filename=f"{safe_name}-candidate-profile.pdf")
 
 
-@app.get("/profile-uplifting/{match_id}/original")
+@app.get("/profile-uplifting/{match_id}/original", dependencies=[Depends(get_current_recruiter)])
 async def download_original_cv(match_id: str):
     if not ObjectId.is_valid(match_id):
         raise HTTPException(404, "Profile not found")
@@ -2513,7 +2482,7 @@ async def download_original_cv(match_id: str):
     return FileResponse(original_path, filename=original.get("source_file") or original_path.name)
 
 
-@app.post("/jobs/upload")
+@app.post("/jobs/upload", dependencies=[Depends(get_current_recruiter)])
 async def upload_job(
     file: UploadFile = File(...),
     client_name: Optional[str] = Form(None),
@@ -2584,7 +2553,7 @@ async def upload_job(
     }
 
 
-@app.post("/candidates/upload")
+@app.post("/candidates/upload", dependencies=[Depends(get_current_recruiter)])
 async def upload_candidate(file: UploadFile = File(...)):
     """
     Upload a CV file (.docx or .pdf). Parses it, embeds it, stores it as a
@@ -2644,7 +2613,7 @@ async def upload_candidate(file: UploadFile = File(...)):
     }
 
 
-@app.get("/matches/by-job/{job_id}")
+@app.get("/matches/by-job/{job_id}", dependencies=[Depends(get_current_recruiter)])
 async def get_matches_by_job(job_id: str):
     """Ranked list of candidates for one job, highest score first."""
     matches = await matches_collection.find({"job_id": ObjectId(job_id)}).to_list(length=None)
@@ -2670,7 +2639,7 @@ async def get_matches_by_job(job_id: str):
     return {"job_id": job_id, "ranked_candidates": enriched}
 
 
-@app.get("/matches/by-candidate/{candidate_id}")
+@app.get("/matches/by-candidate/{candidate_id}", dependencies=[Depends(get_current_recruiter)])
 async def get_matches_by_candidate(candidate_id: str):
     """Ranked list of jobs for one candidate, best fit first."""
     matches = await matches_collection.find({"candidate_id": ObjectId(candidate_id)}).to_list(length=None)
@@ -2715,7 +2684,7 @@ class StatusUpdate(BaseModel):
     status_note: Optional[str] = ""
 
 
-@app.patch("/matches/{match_id}/status")
+@app.patch("/matches/{match_id}/status", dependencies=[Depends(get_current_recruiter)])
 async def update_match_status(match_id: str, body: StatusUpdate):
     """
     Move a match record through the pipeline.
@@ -2751,7 +2720,7 @@ async def update_match_status(match_id: str, body: StatusUpdate):
     }
 
 
-@app.get("/matches/{match_id}")
+@app.get("/matches/{match_id}", dependencies=[Depends(get_current_recruiter)])
 async def get_match(match_id: str):
     """Get a single match record by ID including cached analysis."""
     m = await matches_collection.find_one({"_id": ObjectId(match_id)})
@@ -2783,7 +2752,7 @@ async def get_match(match_id: str):
 # List endpoints — needed by the dashboard to show all jobs / candidates
 # ---------------------------------------------------------------------------
 
-@app.get("/jobs")
+@app.get("/jobs", dependencies=[Depends(get_current_recruiter)])
 async def list_jobs(status: Optional[str] = None):
     """
     List all jobs stored in the database.
@@ -2822,7 +2791,7 @@ async def list_jobs(status: Optional[str] = None):
     }
 
 
-@app.get("/candidates")
+@app.get("/candidates", dependencies=[Depends(get_current_recruiter)])
 async def list_candidates():
     """
     List all candidates stored in the database.
@@ -2853,7 +2822,7 @@ async def list_candidates():
     }
 
 
-@app.get("/jobs/{job_id}")
+@app.get("/jobs/{job_id}", dependencies=[Depends(get_current_recruiter)])
 async def get_job(job_id: str):
     """Get full details of one job by ID."""
     job = await jobs_collection.find_one({"_id": ObjectId(job_id)})
@@ -2880,7 +2849,7 @@ async def get_job(job_id: str):
     }
 
 
-@app.get("/candidates/{candidate_id}")
+@app.get("/candidates/{candidate_id}", dependencies=[Depends(get_current_recruiter)])
 async def get_candidate(candidate_id: str):
     """Get full details of one candidate by ID."""
     cand = await candidates_collection.find_one({"_id": ObjectId(candidate_id)})

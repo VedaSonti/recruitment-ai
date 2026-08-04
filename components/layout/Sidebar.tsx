@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import {
   BriefcaseBusiness,
   ClipboardCheck,
@@ -12,10 +12,10 @@ import {
   Send,
   Sparkles,
   Trophy,
-  Upload,
+  LogOut,
   Users,
 } from "lucide-react";
-import { getJobs } from "@/src/lib/api";
+import { getJobs, logoutRecruiter, type RecruiterUser } from "@/src/lib/api";
 import { getJobId } from "@/src/lib/utils";
 
 const navItems = [
@@ -34,10 +34,23 @@ const navItems = [
   { label: "Client Delivery", href: "/delivery", icon: Send, active: ["/delivery"] },
 ];
 
-export function Sidebar() {
+export function Sidebar({ recruiter }: { recruiter: RecruiterUser | null }) {
   const pathname = usePathname();
+  const router = useRouter();
   const [firstJobId, setFirstJobId] = useState("");
   const [notice, setNotice] = useState("");
+  const [isSigningOut, setIsSigningOut] = useState(false);
+
+  async function signOut() {
+    if (isSigningOut) return;
+    setIsSigningOut(true);
+    try {
+      await logoutRecruiter();
+    } finally {
+      router.replace("/sign-in");
+      router.refresh();
+    }
+  }
 
   useEffect(() => {
     getJobs()
@@ -105,15 +118,23 @@ export function Sidebar() {
       ) : null}
 
       <div className="border-t border-white/10 p-4">
-        <div className="flex items-center gap-3 rounded-[8px] bg-white/12 p-4">
-          <span className="flex h-10 w-10 items-center justify-center rounded-full bg-[#ff1717]">
-            <Upload className="h-5 w-5 rotate-180" />
-          </span>
-          <div>
-            <p className="text-[14px] font-bold">Sarah Johnson</p>
-            <p className="text-[12px] text-white/80">Senior Recruiter</p>
+        {recruiter ? (
+          <div className="flex items-center gap-3 rounded-[8px] bg-white/12 p-4">
+            <span className="flex h-10 w-10 items-center justify-center rounded-full bg-[#ff1717] text-[13px] font-bold">
+              {recruiter.full_name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase()}
+            </span>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-[14px] font-bold">{recruiter.full_name}</p>
+              <p className="truncate text-[12px] text-white/80">{recruiter.email}</p>
+            </div>
+            <button aria-label="Sign out" className="rounded p-2 text-white/75 transition hover:bg-white/10 hover:text-white disabled:opacity-50" disabled={isSigningOut} onClick={signOut} title="Sign out" type="button"><LogOut className="h-4 w-4" /></button>
           </div>
-        </div>
+        ) : (
+          <div className="flex items-center gap-3 rounded-[8px] bg-white/12 p-4">
+            <span className="flex h-10 w-10 items-center justify-center rounded-full bg-[#ff1717] text-[13px] font-bold">SJ</span>
+            <div><p className="text-[14px] font-bold">Sarah Johnson</p><p className="text-[12px] text-white/80">Senior Recruiter</p></div>
+          </div>
+        )}
       </div>
     </aside>
   );

@@ -163,6 +163,13 @@ export interface TopCandidateAnalysisResult {
   analysed: Array<{ match_id: string; analysis: DecisionAnalysis }>;
 }
 
+export interface RecruiterUser {
+  user_id: string;
+  email: string;
+  full_name: string;
+  role: string;
+}
+
 export interface UpliftExperience {
   title?: string;
   company?: string;
@@ -299,6 +306,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     ...options,
     headers,
     cache: "no-store",
+    credentials: "include",
   });
   const body = await parseResponse(response);
 
@@ -582,6 +590,42 @@ export async function getInterviewByMatch(matchId: string): Promise<{
 }> {
   return request(`/interviews/by-match/${encodeURIComponent(matchId)}`, {
     method: "GET",
+  });
+}
+
+export function loginRecruiter(
+  email: string,
+  password: string,
+  rememberMe: boolean,
+): Promise<{ user: RecruiterUser }> {
+  return request("/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ email, password, remember_me: rememberMe }),
+  });
+}
+
+export function logoutRecruiter(): Promise<{ message: string }> {
+  return request("/auth/logout", { method: "POST" });
+}
+
+export function getCurrentRecruiter(): Promise<{ user: RecruiterUser }> {
+  return request("/auth/me", { method: "GET" });
+}
+
+export function requestPasswordReset(email: string): Promise<{ message: string }> {
+  return request("/auth/forgot-password", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+}
+
+export function resetRecruiterPassword(
+  token: string,
+  newPassword: string,
+): Promise<{ message: string }> {
+  return request("/auth/reset-password", {
+    method: "POST",
+    body: JSON.stringify({ token, new_password: newPassword }),
   });
 }
 
