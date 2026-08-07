@@ -59,6 +59,12 @@ from db import (
 from auth import get_current_recruiter, router as auth_router
 from email_service import send_email
 from profile_pdf import generate_profile_pdf
+from recording_observations import (
+    OBSERVATION_SCHEMA_VERSION,
+    analyze_recording,
+    recording_analysis_startup_status,
+    unavailable_recording_observations,
+)
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -622,6 +628,15 @@ async def deduplicate_match_documents() -> None:
 
 @app.on_event("startup")
 async def ensure_match_uniqueness() -> None:
+    analysis_status = recording_analysis_startup_status()
+    print(
+        "[recording observations] startup "
+        f"face_package={analysis_status['face_landmarker_package']} "
+        f"face_model={analysis_status['face_landmarker_model']} "
+        f"speaker_package={analysis_status['speaker_diarization_package']} "
+        f"speaker_token={analysis_status['speaker_diarization_token']} "
+        f"speaker_model={analysis_status['speaker_diarization_model']}"
+    )
     await deduplicate_match_documents()
     await matches_collection.create_index(
         [("job_id", 1), ("candidate_id", 1)],
@@ -1783,6 +1798,91 @@ def apply_video_observations_to_responses(responses: list[dict], video_analysis:
     return updated
 
 
+def merge_recording_observations(
+    video_analysis: dict,
+    responses: list[dict],
+    observations_by_question: dict[int, dict],
+) -> dict:
+    """Add deterministic measurements without touching assessment or score fields."""
+    merged = dict(video_analysis or {})
+    merged["observation_schema_version"] = OBSERVATION_SCHEMA_VERSION
+    per_response = [dict(item) for item in merged.get("per_response_observations", [])]
+    per_lookup = {
+        item.get("question_index"): item for item in per_response if isinstance(item, dict)
+    }
+    all_heads = []
+    all_speakers = []
+    for response in responses:
+        question_index = response.get("question_index")
+        item = per_lookup.get(question_index)
+        if item is None:
+            item = {
+                "question_index": question_index,
+                "question": response.get("question"),
+                "transcript": response.get("transcript"),
+                "video_observations": base_response_video_observations(response),
+            }
+            per_response.append(item)
+        item["video_observations"] = dict(item.get("video_observations") or {})
+        recording = observations_by_question.get(question_index) or unavailable_recording_observations(
+            "no_recording", "No recording was available for presentation or speaker observations."
+        )
+        head = recording.get("head_orientation") or {}
+        speaker = recording.get("speaker_observations") or {}
+        item["video_observations"]["head_orientation"] = head
+        item["video_observations"]["speaker_observations"] = speaker
+        all_heads.append(head)
+        all_speakers.append(speaker)
+
+    total_sampled = sum(int(item.get("sampled_frame_count") or 0) for item in all_heads)
+    total_valid = sum(int(item.get("valid_face_frame_count") or 0) for item in all_heads)
+    coverage = round(total_valid / total_sampled * 100, 1) if total_sampled else None
+    sustained_questions = sum(1 for item in all_heads if item.get("sustained_downward_observed"))
+    additional_questions = sum(1 for item in all_speakers if item.get("possible_additional_speaker"))
+    overlap_seconds = round(sum(float(item.get("overlapping_speech_seconds") or 0) for item in all_speakers), 1)
+    completed_heads = sum(1 for item in all_heads if item.get("status") == "completed")
+    completed_speakers = sum(1 for item in all_speakers if item.get("status") == "completed")
+    summary_parts = []
+    if coverage is not None:
+        summary_parts.append(f"A clear face was detected in {coverage:g}% of deterministically sampled frames.")
+    else:
+        summary_parts.append("Clear-face coverage could not be measured from the available recordings.")
+    summary_parts.append(
+        f"Sustained downward head orientation met the configured threshold in {sustained_questions} response{'s' if sustained_questions != 1 else ''}."
+    )
+    summary_parts.append(
+        f"A possible additional voice was flagged in {additional_questions} response{'s' if additional_questions != 1 else ''}."
+    )
+    if overlap_seconds:
+        summary_parts.append(f"Possible overlapping speech totalled approximately {overlap_seconds:g} seconds.")
+    summary_parts.append("These measurements describe the recording only and require recruiter review alongside playback.")
+    environment = {
+        "status": "completed" if completed_heads or completed_speakers else "insufficient_data",
+        "responses_analysed": len(responses),
+        "head_responses_completed": completed_heads,
+        "speaker_responses_completed": completed_speakers,
+        "face_detection_coverage_percent": coverage,
+        "responses_with_sustained_downward_orientation": sustained_questions,
+        "responses_with_possible_additional_speaker": additional_questions,
+        "overlapping_speech_seconds": overlap_seconds,
+        "neutral_summary": " ".join(summary_parts),
+        "assistive_context_notice": (
+            "Presentation and speaker observations are assistive context only. They do not determine honesty, "
+            "personality, emotional state, protected characteristics, or candidate suitability. Recruiters must "
+            "review the underlying recording and make the final decision."
+        ),
+    }
+    overall = dict(merged.get("video_observations") or {})
+    overall["environment_observations"] = environment
+    quality = dict(overall.get("recording_quality") or {})
+    if any(item.get("multiple_faces_detected") is True for item in all_heads):
+        quality["multiple_faces_detected"] = True
+    overall["recording_quality"] = quality
+    merged["video_observations"] = overall
+    merged["per_response_observations"] = per_response
+    return merged
+
+
 @app.post("/interviews/{token}/assess-video")
 async def assess_interview_with_video(token: str):
     """
@@ -1810,11 +1910,16 @@ async def assess_interview_with_video(token: str):
         interview.get("video_analysis_status") == "unavailable"
         and stored_has_frames
     )
+    stale_observation_schema = (
+        (interview.get("video_analysis") or {}).get("observation_schema_version")
+        != OBSERVATION_SCHEMA_VERSION
+    )
 
     if (
         interview.get("assessment")
         and interview.get("video_analysis_status") in ("completed", "failed", "unavailable")
         and not stale_unavailable_with_frames
+        and not stale_observation_schema
     ):
         return {
             "message": "Already assessed",
@@ -1835,6 +1940,42 @@ async def assess_interview_with_video(token: str):
         f"Q{i+1}: {r['question']}\nA: {r.get('transcript', '')}"
         for i, r in enumerate(responses)
     ])
+
+    recording_observations_by_question = {}
+    for response in responses:
+        question_index = response.get("question_index")
+        recording_path = resolve_stored_interview_video_path(response)
+        observation_started = datetime.now(timezone.utc)
+        if not recording_path or not recording_path.is_file():
+            recording_observations = unavailable_recording_observations(
+                "no_recording",
+                "No stored recording was available for presentation or speaker observations.",
+            )
+        else:
+            try:
+                recording_observations = analyze_recording(str(recording_path))
+            except Exception as observation_error:
+                print(
+                    "[recording observations] failed "
+                    f"interview_id={interview['_id']} q={question_index} "
+                    f"error_type={type(observation_error).__name__}"
+                )
+                recording_observations = unavailable_recording_observations(
+                    "failed",
+                    "Optional presentation and speaker analysis failed; transcript, score, and playback remain available.",
+                )
+        recording_observations_by_question[question_index] = recording_observations
+        head = recording_observations.get("head_orientation") or {}
+        speaker = recording_observations.get("speaker_observations") or {}
+        elapsed = (datetime.now(timezone.utc) - observation_started).total_seconds()
+        print(
+            "[recording observations] "
+            f"interview_id={interview['_id']} q={question_index} "
+            f"sampled_frames={head.get('sampled_frame_count', 0)} "
+            f"valid_face_frames={head.get('valid_face_frame_count', 0)} "
+            f"head_status={head.get('status')} speaker_status={speaker.get('status')} "
+            f"analysis_seconds={elapsed:.2f}"
+        )
 
     assessment = interview.get("assessment")
     if not assessment:
@@ -1997,6 +2138,11 @@ Return ONLY valid JSON in this exact shape:
                 video_available=any_video_uploaded,
             )
 
+    video_analysis = merge_recording_observations(
+        video_analysis,
+        responses,
+        recording_observations_by_question,
+    )
     resulting_video_status = video_analysis.get("video_analysis_status")
     for response in responses:
         print(

@@ -528,6 +528,8 @@ export async function getInterviewByMatch(matchId: string): Promise<{
       response_completed_within_limit: boolean | null;
       screen_direction_percentage?: number | null;
       notes: string[];
+      head_orientation?: HeadOrientationObservation;
+      speaker_observations?: SpeakerObservation;
     } | null;
   }>;
   assessment: {
@@ -567,6 +569,7 @@ export async function getInterviewByMatch(matchId: string): Promise<{
       };
       technical_observations: string[];
       neutral_summary: string;
+      environment_observations?: InterviewEnvironmentObservation;
     };
     per_response_observations?: Array<{
       question_index: number;
@@ -581,6 +584,8 @@ export async function getInterviewByMatch(matchId: string): Promise<{
         response_completed_within_limit: boolean | null;
         screen_direction_percentage?: number | null;
         notes: string[];
+        head_orientation?: HeadOrientationObservation;
+        speaker_observations?: SpeakerObservation;
       };
     }>;
   } | null;
@@ -591,6 +596,83 @@ export async function getInterviewByMatch(matchId: string): Promise<{
   return request(`/interviews/by-match/${encodeURIComponent(matchId)}`, {
     method: "GET",
   });
+}
+
+export type ObservationAnalysisStatus =
+  | "no_recording"
+  | "pending"
+  | "completed"
+  | "insufficient_frames"
+  | "insufficient_audio"
+  | "failed"
+  | "model_unavailable"
+  | "insufficient_data";
+
+export interface HeadOrientationObservation {
+  status: ObservationAnalysisStatus;
+  status_reason: string;
+  candidate_visible: "true" | "false" | "unknown";
+  sampled_frame_count: number;
+  valid_face_frame_count: number;
+  face_detection_coverage_percent: number | null;
+  multiple_faces_detected: boolean | null;
+  face_absent_frame_count: number;
+  face_absent_percent: number | null;
+  longest_face_absent_interval_seconds: number | null;
+  longest_face_absent_interval?: { start_seconds: number; end_seconds: number } | null;
+  candidate_left_frame: boolean;
+  downward_frame_count: number;
+  downward_percent_of_valid_frames: number | null;
+  longest_downward_interval_seconds: number | null;
+  longest_downward_interval?: { start_seconds: number; end_seconds: number } | null;
+  sustained_downward_observed: boolean;
+  rapid_movement_count: number;
+  rapid_movement_events: Array<{
+    time_seconds: number;
+    movement_type: "pitch" | "yaw" | "roll";
+    delta_degrees: number;
+  }>;
+  head_observation_intervals: Array<{
+    start_seconds: number;
+    end_seconds: number;
+    type: "sustained_downward_orientation" | "face_absent";
+  }>;
+  mainly_toward_screen: "yes" | "no" | "mixed" | "unknown";
+  notes: string[];
+}
+
+export interface SpeakerObservation {
+  status: ObservationAnalysisStatus;
+  status_reason: string;
+  analysis_method: "pyannote_speaker_diarization";
+  candidate_speech_detected: boolean;
+  estimated_speaker_count: number | null;
+  possible_additional_speaker: boolean;
+  overlapping_speech_detected: boolean;
+  overlapping_speech_seconds: number;
+  possible_second_speaker_intervals: Array<{
+    start_seconds: number;
+    end_seconds: number;
+    speaker_label: string;
+  }>;
+  overlapping_speech_intervals: Array<{ start_seconds: number; end_seconds: number }>;
+  speaker_analysis_confidence: number;
+  speaker_confidence_label: "low" | "moderate" | "high";
+  system_question_audio_included: boolean;
+  notes: string[];
+}
+
+export interface InterviewEnvironmentObservation {
+  status: ObservationAnalysisStatus;
+  responses_analysed: number;
+  head_responses_completed: number;
+  speaker_responses_completed: number;
+  face_detection_coverage_percent: number | null;
+  responses_with_sustained_downward_orientation: number;
+  responses_with_possible_additional_speaker: number;
+  overlapping_speech_seconds: number;
+  neutral_summary: string;
+  assistive_context_notice: string;
 }
 
 export function loginRecruiter(

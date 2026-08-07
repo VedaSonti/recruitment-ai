@@ -9,7 +9,9 @@ numpy
 python-docx
 pypdf
 Pillow
-opencv-python
+opencv-contrib-python==5.0.0.93
+mediapipe==1.0.0
+pyannote.audio==4.0.7
 reportlab
 argon2-cffi
 PyJWT

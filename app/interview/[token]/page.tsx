@@ -1197,8 +1197,10 @@ export default function InterviewPage() {
             />
             <span>
               This interview records audio and video for recruiter review and automated transcription.
-              Automated processing may generate neutral observations about recording quality and interview
-              delivery. It will not determine personality, emotion, honesty, or protected characteristics.
+              Automated processing may generate neutral observations about recording quality, head orientation,
+              and possible additional-speaker or overlapping-speech signals. These signals do not determine
+              personality, emotion, honesty, protected characteristics, or suitability. A recruiter reviews the
+              recording and makes the final decision.
             </span>
           </label>
 

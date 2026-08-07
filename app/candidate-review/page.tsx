@@ -20,6 +20,8 @@ import {
   type Job,
   type Match,
   type MatchStatus,
+  type HeadOrientationObservation,
+  type SpeakerObservation,
 } from "@/src/lib/api";
 import {
   formatDate,
@@ -1004,6 +1006,7 @@ function InterviewResultsModal({
                         <video
                           className="mt-4 w-full rounded-[8px] border border-[#E5E7EB]"
                           controls
+                          id={`response-video-${response.question_index}`}
                           src={resolveMediaUrl(response.video_url) ?? undefined}
                         />
                       ) : response.video_playback_status === "historical_unavailable" ? (
@@ -1036,6 +1039,13 @@ function InterviewResultsModal({
                             </ul>
                           ) : null}
                         </div>
+                      ) : null}
+                      {responseVideo?.head_orientation || responseVideo?.speaker_observations ? (
+                        <RecordingObservationsCard
+                          head={responseVideo.head_orientation}
+                          questionIndex={response.question_index}
+                          speaker={responseVideo.speaker_observations}
+                        />
                       ) : null}
                     </div>
                   );
@@ -1121,6 +1131,7 @@ function VideoObservationsSection({
   const observations = analysis?.video_observations;
   const quality = observations?.recording_quality;
   const delivery = observations?.delivery_observations;
+  const environment = observations?.environment_observations;
   const processing = status === "pending" || status === "processing";
 
   return (
@@ -1167,6 +1178,22 @@ function VideoObservationsSection({
           ) : null}
 
           <ResultList title="Technical and Delivery Observations" items={observations.technical_observations ?? []} />
+
+          {environment ? (
+            <div className="rounded-[8px] border border-[#E5E7EB] bg-white p-4">
+              <h4 className="text-[16px] font-bold text-[#333438]">Interview Environment Observations</h4>
+              <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <ObservationMetric label="Clear-face coverage" value={formatMaybePercent(environment.face_detection_coverage_percent)} />
+                <ObservationMetric label="Sustained downward responses" value={String(environment.responses_with_sustained_downward_orientation)} />
+                <ObservationMetric label="Possible additional voice" value={`${environment.responses_with_possible_additional_speaker} responses`} />
+                <ObservationMetric label="Possible overlap" value={formatSeconds(environment.overlapping_speech_seconds)} />
+              </div>
+              <p className="mt-3 text-[14px] leading-6 text-[#555b66]">{environment.neutral_summary}</p>
+              <p className="mt-3 rounded-[8px] bg-[#F2E1E3] p-3 text-[13px] leading-5 text-[#5C0D1B]">
+                {environment.assistive_context_notice}
+              </p>
+            </div>
+          ) : null}
         </div>
       ) : (
         <div className="rounded-[8px] border border-[#E5E7EB] bg-[#f9fafb] p-4 text-[14px] text-[#77777a]">
@@ -1329,4 +1356,144 @@ function ProgressCard({
       <p className="mt-3 text-[26px] font-bold">{value}</p>
     </div>
   );
+}
+
+function RecordingObservationsCard({
+  head,
+  questionIndex,
+  speaker,
+}: {
+  head?: HeadOrientationObservation;
+  questionIndex: number;
+  speaker?: SpeakerObservation;
+}) {
+  return (
+    <div className="mt-4 rounded-[8px] border border-[#E5E7EB] bg-white p-4">
+      <p className="text-[13px] font-bold uppercase tracking-[0.08em] text-[#5C0D1B]">
+        Presentation and Recording Observations
+      </p>
+      <p className="mt-2 text-[12px] leading-5 text-[#77777a]">
+        Review the recording above before interpreting any timestamped observation.
+      </p>
+      <div className="mt-4 grid gap-4 md:grid-cols-2">
+        <div>
+          <p className="text-[14px] font-bold text-[#333438]">Head orientation</p>
+          {head?.status === "completed" ? (
+            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              <ObservationMetric label="Candidate visible" value={head.candidate_visible === "true" ? "Yes" : head.candidate_visible === "false" ? "No" : "Unknown"} />
+              <ObservationMetric label="Clear-face coverage" value={formatMaybePercent(head.face_detection_coverage_percent)} />
+              <ObservationMetric label="Mainly toward screen" value={capitalize(head.mainly_toward_screen)} />
+              <ObservationMetric label="Downward orientation" value={formatMaybePercent(head.downward_percent_of_valid_frames)} />
+              <ObservationMetric label="Longest downward interval" value={formatSeconds(head.longest_downward_interval_seconds)} />
+              <ObservationMetric label="Rapid movements" value={String(head.rapid_movement_count)} />
+              <ObservationMetric label="Candidate outside frame" value={head.candidate_left_frame ? formatSeconds(head.longest_face_absent_interval_seconds) : "Not sustained"} />
+              <ObservationMetric label="Multiple faces" value={formatBoolean(head.multiple_faces_detected)} />
+            </div>
+          ) : (
+            <ObservationStatusMessage reason={head?.status_reason ?? "Head-orientation analysis is pending."} />
+          )}
+          {head?.head_observation_intervals?.length ? (
+            <ObservationTimestampList
+              intervals={head.head_observation_intervals.map((interval) => ({
+                ...interval,
+                label: interval.type === "face_absent" ? "Review face-absent interval" : "Review downward-orientation interval",
+              }))}
+              questionIndex={questionIndex}
+            />
+          ) : null}
+          {head?.rapid_movement_events?.length ? (
+            <ObservationTimestampList
+              intervals={head.rapid_movement_events.map((event) => ({
+                start_seconds: event.time_seconds,
+                end_seconds: event.time_seconds,
+                label: `Review ${event.movement_type} movement`,
+              }))}
+              questionIndex={questionIndex}
+            />
+          ) : null}
+        </div>
+
+        <div>
+          <p className="text-[14px] font-bold text-[#333438]">Audio speakers</p>
+          {speaker?.status === "completed" ? (
+            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              <ObservationMetric label="Candidate speech" value={speaker.candidate_speech_detected ? "Detected" : "Not detected"} />
+              <ObservationMetric label="Estimated speakers" value={speaker.estimated_speaker_count === null ? "Insufficient evidence" : String(speaker.estimated_speaker_count)} />
+              <ObservationMetric label="Possible additional speaker" value={speaker.possible_additional_speaker ? "Possible—review recording" : "Not indicated"} />
+              <ObservationMetric label="Possible overlapping speech" value={speaker.overlapping_speech_detected ? formatSeconds(speaker.overlapping_speech_seconds) : "Not indicated"} />
+              <ObservationMetric label="Confidence" value={formatConfidence(speaker.speaker_analysis_confidence)} />
+            </div>
+          ) : (
+            <ObservationStatusMessage reason={speaker?.status_reason ?? "Speaker analysis is pending."} />
+          )}
+          {speaker?.possible_second_speaker_intervals?.length ? (
+            <ObservationTimestampList
+              intervals={speaker.possible_second_speaker_intervals.map((interval) => ({
+                ...interval,
+                label: `Review possible additional speaker (${interval.speaker_label})`,
+              }))}
+              questionIndex={questionIndex}
+            />
+          ) : null}
+          {speaker?.overlapping_speech_intervals?.length ? (
+            <ObservationTimestampList
+              intervals={speaker.overlapping_speech_intervals.map((interval) => ({
+                ...interval,
+                label: "Review overlapping speech",
+              }))}
+              questionIndex={questionIndex}
+            />
+          ) : null}
+        </div>
+      </div>
+      <p className="mt-4 rounded-[8px] bg-[#f9fafb] p-3 text-[12px] leading-5 text-[#77777a]">
+        Head orientation may vary because of camera placement, reading, notes, a keyboard, another monitor, lighting, glasses, partial visibility, or mobility. These measurements do not establish attention, assistance, or intent.
+      </p>
+    </div>
+  );
+}
+
+function ObservationTimestampList({
+  intervals,
+  questionIndex,
+}: {
+  intervals: Array<{ start_seconds: number; end_seconds: number; label: string }>;
+  questionIndex: number;
+}) {
+  return (
+    <div className="mt-3 flex flex-wrap gap-2">
+      {intervals.map((interval, index) => (
+        <button
+          className="rounded-full border border-[#d8dee7] bg-white px-3 py-1.5 text-[12px] font-semibold text-[#5C0D1B] hover:bg-[#F2E1E3]"
+          key={`${interval.label}-${interval.start_seconds}-${index}`}
+          onClick={() => seekToObservation(questionIndex, interval.start_seconds)}
+          type="button"
+        >
+          {interval.label}: {formatSeconds(interval.start_seconds)}
+          {interval.end_seconds > interval.start_seconds ? `–${formatSeconds(interval.end_seconds)}` : ""}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function seekToObservation(questionIndex: number, seconds: number) {
+  const video = document.getElementById(`response-video-${questionIndex}`) as HTMLVideoElement | null;
+  if (!video) return;
+  video.currentTime = Math.max(0, seconds);
+  video.scrollIntoView({ behavior: "smooth", block: "center" });
+  video.focus();
+}
+
+function ObservationStatusMessage({ reason }: { reason: string }) {
+  return <p className="mt-3 rounded-[8px] bg-[#f9fafb] p-3 text-[13px] leading-5 text-[#77777a]">{reason}</p>;
+}
+
+function capitalize(value: string) {
+  return value ? `${value.charAt(0).toUpperCase()}${value.slice(1)}` : "Unknown";
+}
+
+function formatConfidence(value: number) {
+  const label = value >= 0.75 ? "High" : value >= 0.5 ? "Moderate" : "Low";
+  return `${label} (${Math.round(value * 100)}%)`;
 }
