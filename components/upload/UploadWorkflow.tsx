@@ -191,8 +191,8 @@ export function UploadWorkflow({
       <Card className="px-6 py-6">
         <div
           className={cx(
-            "flex min-h-[300px] flex-col items-center justify-center rounded-[8px] border border-dashed px-8 py-12 text-center transition",
-            dragging ? "border-crimson-700 bg-crimson-50" : "border-[#cbd5e1]",
+            "flex min-h-[300px] flex-col items-center justify-center rounded-2xl border border-dashed px-8 py-12 text-center transition duration-200",
+            dragging ? "border-brand bg-brand-faint" : "border-slate-300 bg-slate-50/50 hover:border-brand/50 hover:bg-brand-faint/30",
           )}
           onDragEnter={(event) => {
             event.preventDefault();
@@ -209,11 +209,11 @@ export function UploadWorkflow({
             addFiles(event.dataTransfer.files);
           }}
         >
-          <div className="mb-7 flex h-16 w-16 items-center justify-center rounded-[14px] bg-[#e8cfd6] text-crimson-700">
+          <div className="mb-7 flex h-16 w-16 items-center justify-center rounded-2xl bg-brand-faint text-brand shadow-sm ring-1 ring-brand/10">
             <UploadCloud className="h-9 w-9" />
           </div>
-          <h2 className="text-[20px] font-bold text-[#333438]">{dropTitle}</h2>
-          <p className="mt-3 max-w-[520px] text-[15px] leading-6 text-[#8b8f97]">
+          <h2 className="font-display text-[20px] font-bold text-slate-900">{dropTitle}</h2>
+          <p className="mt-3 max-w-[520px] text-[15px] leading-6 text-slate-500">
             {helperText}
           </p>
           <input
@@ -233,7 +233,7 @@ export function UploadWorkflow({
             {browseLabel}
           </Button>
         </div>
-        <p className="mt-4 text-center text-[12px] text-[#a0a4ac]">
+        <p className="mt-4 text-center text-[12px] text-slate-400">
           You can upload multiple files at once. Processing runs one file at a time.
         </p>
       </Card>
@@ -241,24 +241,24 @@ export function UploadWorkflow({
       {manualDetails ? (
         <Card className="px-6 py-5">
           <button
-            className="flex w-full items-center justify-between text-left text-[15px] font-bold text-[#333438]"
+            className="flex w-full items-center justify-between text-left text-[15px] font-semibold text-slate-900"
             onClick={() => setDetailsOpen((current) => !current)}
             type="button"
           >
             <span>
               Add job details manually{" "}
-              <span className="font-normal text-[#a0a4ac]">(optional)</span>
+              <span className="font-normal text-slate-400">(optional)</span>
             </span>
             {detailsOpen ? (
-              <ChevronUp className="h-4 w-4 text-[#98a2b3]" />
+              <ChevronUp className="h-4 w-4 text-slate-400" />
             ) : (
-              <ChevronDown className="h-4 w-4 text-crimson-700" />
+              <ChevronDown className="h-4 w-4 text-brand" />
             )}
           </button>
 
           {detailsOpen ? (
             <div className="mt-8">
-              <p className="mb-5 text-[13px] italic text-[#9ca0a8]">
+              <p className="mb-5 text-[13px] italic text-slate-400">
                 Only needed if you want to override what GPT extracts.
               </p>
               <div className="grid gap-5 sm:grid-cols-2">
@@ -303,7 +303,7 @@ export function UploadWorkflow({
       {queue.length > 0 ? (
         <Card className="px-6 py-5">
           <div className="mb-4 flex items-center justify-between">
-            <h2 className="text-[20px] font-bold text-[#333438]">Selected Files</h2>
+            <h2 className="font-display text-[20px] font-bold text-slate-900">Selected Files</h2>
             <Badge tone="crimson">{queue.length} files</Badge>
           </div>
           <div className="space-y-3">
@@ -343,9 +343,9 @@ function Input({
 }) {
   return (
     <label className="block">
-      <span className="mb-2 block text-[14px] font-bold text-[#333438]">{label}</span>
+      <span className="mb-2 block text-[14px] font-semibold text-slate-700">{label}</span>
       <input
-        className="h-10 w-full rounded-[8px] border border-[#d8dee7] px-4 text-[14px] outline-none focus:border-crimson-700"
+        className="field h-10"
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
         value={value}
@@ -374,15 +374,15 @@ function FileRow({
           : "grey";
 
   return (
-    <div className="rounded-[8px] border border-[#E5E7EB] bg-[#fbfcfd] px-4 py-4">
+    <div className="rounded-xl border border-slate-100 bg-slate-50/60 px-4 py-4 transition hover:border-slate-200 hover:bg-white hover:shadow-sm">
       <div className="flex items-start gap-3">
-        <FileText className="mt-1 h-5 w-5 shrink-0 text-crimson-700" />
+        <FileText className="mt-1 h-5 w-5 shrink-0 text-brand" />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <p className="truncate text-[14px] font-bold text-[#333438]">
+            <p className="truncate text-[14px] font-semibold text-slate-900">
               {item.file.name}
             </p>
-            <span className="text-[12px] text-[#9ca0a8]">
+            <span className="text-[12px] text-slate-400">
               {fileSize(item.file.size)}
             </span>
             <Badge tone={tone}>

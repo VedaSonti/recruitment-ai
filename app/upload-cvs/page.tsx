@@ -61,7 +61,7 @@ export default function UploadCvsPage() {
           />
 
           {processedCount > 0 ? (
-            <section className="flex flex-col gap-4 rounded-[8px] bg-crimson-700 px-6 py-5 text-white md:flex-row md:items-center md:justify-between">
+            <section className="flex flex-col gap-4 rounded-2xl bg-brand px-6 py-5 text-white shadow-lg shadow-brand/15 md:flex-row md:items-center md:justify-between">
               <p className="text-[16px] font-bold">
                 {"\u2713"} {processedCount} CV{processedCount === 1 ? "" : "s"} uploaded - match against all existing jobs?
               </p>
@@ -105,7 +105,7 @@ export default function UploadCvsPage() {
       </div>
 
       <section className="mt-8">
-        <h2 className="mb-4 text-[18px] font-bold text-[#333438]">
+        <h2 className="mb-4 font-display text-[20px] font-bold text-slate-900">
           Uploaded Candidates
         </h2>
         <Card className="overflow-hidden">
@@ -116,21 +116,21 @@ export default function UploadCvsPage() {
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full min-w-[900px] border-collapse text-left">
-                <thead className="bg-[#f5f6f8]">
+                <thead className="table-head">
                   <tr>
                     {["Name", "Email", "Skills", "Work Rights", "Notice Period", "View Profile"].map((header) => (
-                      <th className="px-5 py-4 text-[12px] font-bold uppercase tracking-[0.06em] text-[#9ca0a8]" key={header}>
+                      <th className="px-5 py-4" key={header}>
                         {header}
                       </th>
                     ))}
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-[#edf0f3]">
+                <tbody className="divide-y divide-slate-100">
                   {candidates.map((candidate) => {
                     const id = getCandidateId(candidate);
                     return (
-                      <tr key={id || candidate.name}>
-                        <td className="px-5 py-4 text-[14px] font-bold text-[#333438]">
+                      <tr className="transition-colors hover:bg-brand-faint/40" key={id || candidate.name}>
+                        <td className="px-5 py-4 text-[14px] font-semibold text-slate-900">
                           {candidate.name ?? "Unnamed Candidate"}
                         </td>
                         <td className="max-w-[220px] truncate px-5 py-4 text-[14px] text-[#77777a]">
@@ -174,11 +174,11 @@ export default function UploadCvsPage() {
 
 function RecentCandidateCard({ candidate }: { candidate: Candidate }) {
   return (
-    <div className="rounded-[8px] border border-[#E5E7EB] px-4 py-4">
+    <div className="rounded-xl border border-slate-100 bg-slate-50/50 px-4 py-4 transition hover:bg-white hover:shadow-sm">
       <div className="flex gap-4">
-        <FileText className="mt-1 h-5 w-5 shrink-0 text-[#98a2b3]" />
+        <FileText className="mt-1 h-5 w-5 shrink-0 text-slate-400" />
         <div className="min-w-0">
-          <p className="truncate text-[14px] font-bold text-[#333438]">
+          <p className="truncate text-[14px] font-semibold text-slate-900">
             {candidate.name ?? candidate.source_file ?? "Unnamed Candidate"}
           </p>
           <SkillTags skills={(candidate.skills ?? []).slice(0, 3)} />

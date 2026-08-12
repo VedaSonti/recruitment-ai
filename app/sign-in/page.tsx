@@ -57,18 +57,18 @@ export default function SignInPage() {
   }
 
   return (
-    <div className="signin-page relative min-h-screen overflow-hidden bg-[#fbf9fa] text-[#333333]">
+    <div className="signin-page app-bg relative min-h-screen overflow-hidden text-slate-900">
       <div className="pointer-events-none absolute inset-0" aria-hidden="true">
-        <div className="absolute -right-28 -top-36 h-[430px] w-[430px] rounded-full bg-[#F2E1E3] blur-3xl" />
-        <div className="absolute -bottom-48 left-[42%] h-[420px] w-[420px] rounded-full bg-[#E01111]/[0.06] blur-3xl" />
+        <div className="absolute -right-28 -top-36 h-[430px] w-[430px] rounded-full bg-brand/10 blur-3xl" />
+        <div className="absolute -bottom-48 left-[42%] h-[420px] w-[420px] rounded-full bg-brand/[0.06] blur-3xl" />
       </div>
 
       <div className="relative grid min-h-screen lg:grid-cols-[46%_54%]">
-        <section className="signin-panel relative hidden overflow-hidden bg-[#5C0D1B] px-12 py-10 text-white lg:flex lg:flex-col xl:px-16 xl:py-12">
+        <section className="signin-panel sidebar-bg relative hidden overflow-hidden px-12 py-10 text-white lg:flex lg:flex-col xl:px-16 xl:py-12">
           <div className="absolute inset-0 opacity-30" aria-hidden="true">
             <div className="absolute -left-24 top-32 h-72 w-72 rounded-full border border-white/20" />
             <div className="absolute -left-7 top-52 h-72 w-72 rounded-full border border-white/10" />
-            <div className="absolute bottom-12 right-[-80px] h-80 w-80 rotate-12 rounded-[48px] border border-[#E01111]/45" />
+            <div className="absolute bottom-12 right-[-80px] h-80 w-80 rotate-12 rounded-[48px] border border-brand/45" />
           </div>
 
           <BrandMark />
@@ -78,8 +78,8 @@ export default function SignInPage() {
               <Sparkles className="h-4 w-4 text-[#ff5656]" />
               AI-powered talent intelligence
             </div>
-            <h1 className="max-w-[480px] text-[42px] font-bold leading-[1.12] tracking-[-0.035em] xl:text-[50px]">
-              Recruitment decisions, elevated.
+            <h1 className="font-display max-w-[480px] text-[42px] font-bold leading-[1.08] tracking-[-0.045em] xl:text-[50px]">
+              Recruitment decisions, <span className="font-accent font-normal italic text-brand-light">elevated.</span>
             </h1>
             <p className="mt-6 max-w-[470px] text-[16px] leading-7 text-white/72">
               A focused workspace for matching exceptional people with the right opportunities—faster, consistently, and with confidence.
@@ -104,13 +104,13 @@ export default function SignInPage() {
             </div>
 
             <div className="mb-9">
-              <p className="mb-3 text-[12px] font-bold uppercase tracking-[0.16em] text-[#E01111]">
+              <p className="mb-3 text-[11px] font-bold uppercase tracking-[0.16em] text-brand">
                 Recruiter portal
               </p>
-              <h2 className="text-[34px] font-bold leading-tight tracking-[-0.03em] text-[#333333] sm:text-[38px]">
+              <h2 className="font-display text-[34px] font-bold leading-tight tracking-[-0.04em] text-slate-950 sm:text-[38px]">
                 Welcome back
               </h2>
-              <p className="mt-3 text-[15px] leading-6 text-[#6f7075]">
+              <p className="mt-3 text-[15px] leading-6 text-slate-500">
                 Sign in to continue to your recruitment workspace.
               </p>
             </div>
@@ -118,7 +118,7 @@ export default function SignInPage() {
             <form className="space-y-5" noValidate onSubmit={handleSubmit}>
               {error ? (
                 <div
-                  className="signin-alert rounded-[10px] border border-[#e9b9c0] bg-[#F2E1E3] px-4 py-3 text-[13px] leading-5 text-[#5C0D1B]"
+                  className="signin-alert rounded-xl border border-brand/20 bg-brand-faint px-4 py-3 text-[13px] leading-5 text-brand-dark"
                   id="sign-in-error"
                   role="alert"
                 >
@@ -127,7 +127,7 @@ export default function SignInPage() {
               ) : null}
 
               <div>
-                <label className="mb-2 block text-[13px] font-bold text-[#333333]" htmlFor="email">Work email</label>
+                <label className="mb-2 block text-[13px] font-semibold text-slate-700" htmlFor="email">Work email</label>
                 <span className="relative block">
                   <Mail className="pointer-events-none absolute left-3.5 top-1/2 h-[18px] w-[18px] -translate-y-1/2 text-[#8c8e94]" />
                   <input
@@ -135,7 +135,7 @@ export default function SignInPage() {
                     aria-invalid={Boolean(error)}
                     autoComplete="email"
                     autoFocus
-                    className="h-[50px] w-full rounded-[9px] border border-[#d8dadd] bg-white pl-11 pr-4 text-[15px] text-[#333333] outline-none transition placeholder:text-[#a4a6ab] hover:border-[#b6b8bd] focus:border-[#5C0D1B] focus:ring-4 focus:ring-[#5C0D1B]/10"
+                    className="h-[50px] w-full rounded-xl border border-slate-200 bg-white pl-11 pr-4 text-[15px] text-slate-900 outline-none transition placeholder:text-slate-400 hover:border-slate-300 focus:border-brand focus:ring-4 focus:ring-brand/10"
                     id="email"
                     inputMode="email"
                     name="email"
@@ -149,14 +149,14 @@ export default function SignInPage() {
               </div>
 
               <div>
-                <label className="mb-2 block text-[13px] font-bold text-[#333333]" htmlFor="password">Password</label>
+                <label className="mb-2 block text-[13px] font-semibold text-slate-700" htmlFor="password">Password</label>
                 <span className="relative block">
                   <LockKeyhole className="pointer-events-none absolute left-3.5 top-1/2 h-[18px] w-[18px] -translate-y-1/2 text-[#8c8e94]" />
                   <input
                     aria-describedby={error ? "sign-in-error" : undefined}
                     aria-invalid={Boolean(error)}
                     autoComplete="current-password"
-                    className="h-[50px] w-full rounded-[9px] border border-[#d8dadd] bg-white pl-11 pr-12 text-[15px] text-[#333333] outline-none transition placeholder:text-[#a4a6ab] hover:border-[#b6b8bd] focus:border-[#5C0D1B] focus:ring-4 focus:ring-[#5C0D1B]/10"
+                    className="h-[50px] w-full rounded-xl border border-slate-200 bg-white pl-11 pr-12 text-[15px] text-slate-900 outline-none transition placeholder:text-slate-400 hover:border-slate-300 focus:border-brand focus:ring-4 focus:ring-brand/10"
                     id="password"
                     name="password"
                     onChange={(event) => setPassword(event.target.value)}
@@ -168,7 +168,7 @@ export default function SignInPage() {
                   <button
                     aria-label={showPassword ? "Hide password" : "Show password"}
                     aria-pressed={showPassword}
-                    className="absolute right-2 top-1/2 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-[7px] text-[#77797f] transition hover:bg-[#F2E1E3] hover:text-[#5C0D1B] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5C0D1B]"
+                    className="absolute right-2 top-1/2 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-lg text-slate-500 transition hover:bg-brand-faint hover:text-brand-dark focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand"
                     onClick={() => setShowPassword((visible) => !visible)}
                     type="button"
                   >
@@ -189,7 +189,7 @@ export default function SignInPage() {
                   Remember me
                 </label>
                 <Link
-                  className="font-bold text-[#5C0D1B] transition hover:text-[#E01111] focus-visible:rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#5C0D1B]/30"
+                  className="font-bold text-brand-dark transition hover:text-brand focus-visible:rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/30"
                   href="/forgot-password"
                 >
                   Forgot password?
@@ -197,7 +197,7 @@ export default function SignInPage() {
               </div>
 
               <Button
-                className="mt-1 h-[50px] w-full border-[#5C0D1B] bg-[#5C0D1B] text-[15px] shadow-[0_10px_22px_rgba(92,13,27,0.18)] hover:border-[#4b0916] hover:bg-[#4b0916] focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-[#5C0D1B]/20"
+                className="mt-1 h-[50px] w-full text-[15px] shadow-lg shadow-brand/15 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-brand/20"
                 isLoading={isLoading}
                 rightIcon={!isLoading ? <ArrowRight className="h-[18px] w-[18px]" /> : undefined}
                 type="submit"
@@ -220,11 +220,11 @@ function BrandMark({ dark = false }: { dark?: boolean }) {
   return (
     <Link
       aria-label="iSOFT Recruitment home"
-      className={`relative inline-flex items-center gap-3 self-start ${dark ? "text-[#333333]" : "text-white"}`}
+      className={`relative inline-flex items-center gap-3 self-start font-display ${dark ? "text-slate-900" : "text-white"}`}
       href="/sign-in"
     >
-      <span className="text-[29px] font-black leading-none tracking-[-0.08em] text-[#E01111]">iSOFT</span>
-      <span className={`h-6 w-px ${dark ? "bg-[#5C0D1B]/20" : "bg-white/25"}`} />
+      <span className="text-[29px] font-black leading-none tracking-[-0.08em] text-brand">iSOFT</span>
+      <span className={`h-6 w-px ${dark ? "bg-brand/20" : "bg-white/25"}`} />
       <span className="text-[17px] font-bold">Recruitment</span>
     </Link>
   );

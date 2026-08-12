@@ -11,7 +11,7 @@ export function Card({
   return (
     <section
       className={cx(
-        "rounded-[8px] border border-[#E5E7EB] bg-white shadow-soft",
+        "rounded-2xl border border-slate-100 bg-white shadow-soft",
         className,
       )}
     >
@@ -34,11 +34,11 @@ export function CardHeader({
   return (
     <div className={cx("flex items-start justify-between gap-4", className)}>
       <div>
-        <h2 className="text-[20px] font-bold leading-6 text-[#333438]">
+        <h2 className="font-display text-[20px] font-bold leading-6 tracking-[-0.02em] text-slate-900">
           {title}
         </h2>
         {subtitle ? (
-          <p className="mt-1 text-[14px] leading-5 text-[#77777a]">{subtitle}</p>
+          <p className="mt-1 text-[14px] leading-5 text-slate-500">{subtitle}</p>
         ) : null}
       </div>
       {action}

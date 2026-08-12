@@ -4,7 +4,34 @@
 
 @layer components {
   .field {
-    @apply w-full rounded-[8px] border border-[#d8dee7] px-3 py-2 text-[14px] text-[#333438] outline-none transition focus:border-[#5C0D1B] focus:ring-1 focus:ring-[#5C0D1B];
+    @apply w-full rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-[14px] text-slate-900 outline-none transition duration-200 placeholder:text-slate-400 hover:border-slate-300 focus:border-brand focus:ring-2 focus:ring-brand/10;
+  }
+
+  .app-bg {
+    background-color: #f8fafc;
+    background-image: radial-gradient(circle at 8% 0%, rgba(227, 30, 36, 0.055), transparent 26rem), linear-gradient(180deg, #ffffff 0%, #f8fafc 28rem);
+  }
+
+  .sidebar-bg {
+    background-color: #150208;
+    background-image: radial-gradient(rgba(227, 30, 36, 0.22) 0.75px, transparent 0.75px);
+    background-size: 18px 18px;
+  }
+
+  .nav-active {
+    @apply bg-brand/20 text-white shadow-sm ring-1 ring-inset ring-brand/30;
+  }
+
+  .surface-card {
+    @apply rounded-2xl border border-slate-100 bg-white shadow-soft;
+  }
+
+  .table-head {
+    @apply bg-slate-50 text-[11px] font-bold uppercase tracking-[0.08em] text-slate-500;
+  }
+
+  .table-row {
+    @apply border-t border-slate-100 transition-colors hover:bg-brand-faint/40;
   }
 }
 
@@ -23,9 +50,11 @@ body {
 
 body {
   margin: 0;
-  background: #ffffff;
-  color: #333438;
-  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  background: #f8fafc;
+  color: #0f172a;
+  font-family: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 button,
@@ -40,17 +69,73 @@ a {
   text-decoration: none;
 }
 
+:focus-visible {
+  outline: 2px solid #e31e24;
+  outline-offset: 2px;
+}
+
+::selection {
+  background: rgba(227, 30, 36, 0.16);
+}
+
+/* Normalize legacy presentation utilities through the shared Envoyin theme. */
+[class~="rounded-[8px]"] {
+  border-radius: 0.75rem !important;
+}
+
+[class~="border-[#E5E7EB]"],
+[class~="border-[#d8dee7]"] {
+  border-color: #e2e8f0 !important;
+}
+
+[class~="bg-[#f5f6f8]"],
+[class~="bg-[#fbfcfd]"] {
+  background-color: #f8fafc !important;
+}
+
+[class~="bg-[#e8cfd6]"],
+[class~="bg-[#F2E1E3]"] {
+  background-color: #fef2f2 !important;
+}
+
+[class~="bg-[#ff1717]"],
+[class~="bg-[#E01111]"] {
+  background-color: #e31e24 !important;
+}
+
+[class~="text-[#333438]"],
+[class~="text-[#333333]"] {
+  color: #0f172a !important;
+}
+
+[class~="text-[#77777a]"],
+[class~="text-[#6f7075]"],
+[class~="text-[#8b8f97]"] {
+  color: #64748b !important;
+}
+
+[class~="text-[#98a2b3]"],
+[class~="text-[#9ca0a8]"],
+[class~="text-[#a0a4ac]"] {
+  color: #94a3b8 !important;
+}
+
+[class~="text-[#ff1717]"],
+[class~="text-[#E01111]"] {
+  color: #e31e24 !important;
+}
+
 ::-webkit-scrollbar {
-  height: 10px;
-  width: 10px;
+  height: 6px;
+  width: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #f3f4f6;
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #c7cbd1;
+  background: #cbd5e1;
   border-radius: 999px;
 }
 

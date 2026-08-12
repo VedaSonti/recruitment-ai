@@ -36,11 +36,11 @@ export function AppShell({ children }: { children: ReactNode }) {
   }, [isAuthPage, isCandidateInterview, router]);
 
   if (isAuthPage) {
-    return <div className="min-h-screen bg-white">{children}</div>;
+    return <div className="app-bg min-h-screen">{children}</div>;
   }
 
   if (!isCandidateInterview && checkingSession) {
-    return <div className="flex min-h-screen items-center justify-center bg-white"><LoadingSpinner size="lg" /></div>;
+    return <div className="app-bg flex min-h-screen items-center justify-center"><LoadingSpinner size="lg" /></div>;
   }
 
   if (!isCandidateInterview && !recruiter) {
@@ -48,10 +48,10 @@ export function AppShell({ children }: { children: ReactNode }) {
   }
 
   return (
-    <div className="flex h-screen overflow-hidden bg-white">
+    <div className="app-bg flex h-screen overflow-hidden">
       <Sidebar recruiter={recruiter} />
-      <main className="min-w-0 flex-1 overflow-y-auto bg-white px-8 py-8">
-        <div className="mx-auto max-w-[1180px]">{children}</div>
+      <main className="min-w-0 flex-1 overflow-y-auto px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
+        <div className="mx-auto max-w-[1280px]">{children}</div>
       </main>
     </div>
   );

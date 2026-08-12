@@ -16,8 +16,8 @@ export function ProgressBar({
         : "bg-[#ef4444]";
 
   return (
-    <div className={cx("h-2 overflow-hidden rounded-full bg-[#edf0f4]", className)}>
-      <div className={cx("h-full rounded-full", color)} style={{ width: `${clamped}%` }} />
+    <div className={cx("h-2 overflow-hidden rounded-full bg-slate-100", className)}>
+      <div className={cx("h-full rounded-full transition-[width] duration-500", color)} style={{ width: `${clamped}%` }} />
     </div>
   );
 }

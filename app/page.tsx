@@ -135,7 +135,7 @@ export default function DashboardPage() {
         <h1 className="text-[22px] font-bold text-crimson-700">
           Dashboard unavailable
         </h1>
-        <p className="mt-3 text-[15px] leading-6 text-[#77777a]">{error}</p>
+        <p className="mt-3 text-[15px] leading-6 text-slate-500">{error}</p>
       </Card>
     );
   }
@@ -155,7 +155,7 @@ export default function DashboardPage() {
       </div>
 
       <section className="mt-9">
-        <h2 className="mb-4 text-[22px] font-bold text-[#333438]">Quick Actions</h2>
+        <h2 className="mb-4 font-display text-[22px] font-bold tracking-[-0.02em] text-slate-900">Quick Actions</h2>
         <div className="grid gap-4 lg:grid-cols-3">
           <Link href="/upload-job">
             <Button className="w-full" leftIcon={<Upload className="h-5 w-5" />} size="lg">
@@ -180,27 +180,27 @@ export default function DashboardPage() {
           <CardHeader className="px-6 py-5" title="Recent Jobs" />
           <div className="overflow-x-auto">
             <table className="w-full min-w-[760px] border-collapse text-left">
-              <thead className="bg-[#e8cfd6]">
+              <thead className="table-head">
                 <tr>
                   {["Job Title", "Client", "Candidates", "Shortlisted", "Status", "Actions"].map((header) => (
-                    <th className="px-6 py-3 text-[12px] font-bold uppercase tracking-[0.04em] text-crimson-700" key={header}>
+                    <th className="px-6 py-3.5" key={header}>
                       {header}
                     </th>
                   ))}
                 </tr>
               </thead>
-              <tbody className="divide-y divide-[#edf0f3]">
+              <tbody className="divide-y divide-slate-100">
                 {jobs.slice(0, 6).map((job) => {
                   const id = getJobId(job);
                   const meta = jobMeta[id] ?? { candidates: 0, shortlisted: 0 };
                   return (
-                    <tr className="hover:bg-[#fbf7f8]" key={id || getJobTitle(job)}>
-                      <td className="px-6 py-4 text-[14px] font-bold text-[#333438]">
+                    <tr className="transition-colors hover:bg-brand-faint/40" key={id || getJobTitle(job)}>
+                      <td className="px-6 py-4 text-[14px] font-semibold text-slate-900">
                         {getJobTitle(job)}
                       </td>
-                      <td className="px-6 py-4 text-[14px] text-[#77777a]">{getClient(job)}</td>
-                      <td className="px-6 py-4 text-[14px] text-[#333438]">{meta.candidates}</td>
-                      <td className="px-6 py-4 text-[14px] font-bold text-[#ff1717]">{meta.shortlisted}</td>
+                      <td className="px-6 py-4 text-[14px] text-slate-500">{getClient(job)}</td>
+                      <td className="px-6 py-4 text-[14px] text-slate-700">{meta.candidates}</td>
+                      <td className="px-6 py-4 text-[14px] font-bold text-brand">{meta.shortlisted}</td>
                       <td className="px-6 py-4">
                         <Badge tone={statusTone(job.status)}>{job.status ?? "Open"}</Badge>
                       </td>
@@ -232,20 +232,20 @@ export default function DashboardPage() {
             {candidates.slice(0, 5).map((candidate) => {
               const id = getCandidateId(candidate);
               return (
-                <div className="rounded-[8px] border border-[#E5E7EB] px-4 py-3" key={id || candidate.name}>
+                <div className="rounded-xl border border-slate-100 bg-slate-50/50 px-4 py-3 transition hover:border-brand/20 hover:bg-white hover:shadow-sm" key={id || candidate.name}>
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <p className="truncate text-[14px] font-bold text-[#333438]">
+                      <p className="truncate text-[14px] font-semibold text-slate-900">
                         {candidate.name ?? "Unnamed Candidate"}
                       </p>
-                      <p className="mt-1 truncate text-[12px] text-[#77777a]">
+                      <p className="mt-1 truncate text-[12px] text-slate-500">
                         {candidate.email ?? "No email"}
                       </p>
-                      <p className="mt-1 text-[12px] text-[#9ca0a8]">
+                      <p className="mt-1 text-[12px] text-slate-400">
                         {formatDate(candidate.created_at)}
                       </p>
                     </div>
-                    <FileUp className="h-5 w-5 text-[#98a2b3]" />
+                    <FileUp className="h-5 w-5 text-slate-400" />
                   </div>
                   {id ? (
                     <Link className="mt-2 inline-block text-[13px] font-bold text-crimson-700" href={`/candidates/${encodeURIComponent(id)}`}>

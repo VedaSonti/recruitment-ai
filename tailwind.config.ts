@@ -9,22 +9,20 @@ const config: Config = {
   theme: {
     extend: {
       fontFamily: {
-        sans: ["Inter", "ui-sans-serif", "system-ui", "sans-serif"],
+        sans: ["DM Sans", "ui-sans-serif", "system-ui", "sans-serif"],
+        display: ["Bricolage Grotesque", "DM Sans", "ui-sans-serif", "sans-serif"],
+        accent: ["Instrument Serif", "Georgia", "serif"],
       },
       colors: {
+        brand: { DEFAULT: "#E31E24", light: "#F87171", dark: "#C01015", faint: "#FEF2F2" },
         crimson: {
-          50: "#fff1f3",
-          100: "#ffe1e6",
-          200: "#e8cfd6",
-          500: "#b70735",
-          600: "#970a34",
-          700: "#8b0834",
-          800: "#7B1111",
-          900: "#610b23",
+          50: "#FEF2F2", 100: "#FEE2E2", 200: "#FECACA", 500: "#E31E24",
+          600: "#D71920", 700: "#C01015", 800: "#150208", 900: "#0D0105",
         },
       },
       boxShadow: {
-        soft: "0 1px 3px rgba(16, 24, 40, 0.12)",
+        soft: "0 1px 2px rgba(15, 23, 42, 0.04), 0 8px 24px rgba(15, 23, 42, 0.06)",
+        lift: "0 18px 45px rgba(15, 23, 42, 0.10)",
       },
     },
   },

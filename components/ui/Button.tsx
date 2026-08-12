@@ -27,16 +27,16 @@ export function Button({
   return (
     <button
       className={cx(
-        "inline-flex items-center justify-center gap-2 rounded-[8px] border text-[14px] font-bold transition disabled:cursor-not-allowed disabled:opacity-60",
+        "inline-flex items-center justify-center gap-2 rounded-xl border text-[14px] font-semibold shadow-sm transition duration-200 focus-visible:ring-2 focus-visible:ring-brand/20 disabled:cursor-not-allowed disabled:opacity-60",
         size === "sm" && "h-9 px-4",
         size === "md" && "h-11 px-5",
         size === "lg" && "h-13 px-7 text-[15px]",
         variant === "primary" &&
-          "border-crimson-700 bg-crimson-700 text-white hover:bg-crimson-800",
+          "border-brand bg-brand text-white shadow-brand/10 hover:-translate-y-0.5 hover:border-brand-dark hover:bg-brand-dark hover:shadow-md",
         variant === "secondary" &&
-          "border-[#d8dee7] bg-white text-[#333438] hover:border-crimson-700 hover:text-crimson-700",
+          "border-slate-200 bg-white text-slate-700 hover:-translate-y-0.5 hover:border-brand/40 hover:text-brand-dark hover:shadow-md",
         variant === "ghost" &&
-          "border-transparent bg-transparent text-[#333438] hover:bg-[#f3f4f6]",
+          "border-transparent bg-transparent text-slate-700 shadow-none hover:bg-slate-100",
         variant === "danger" &&
           "border-[#dc2626] bg-[#dc2626] text-white hover:bg-[#b91c1c]",
         className,

@@ -82,7 +82,7 @@ export default function UploadJobPage() {
       </div>
 
       <section className="mt-8">
-        <h2 className="mb-4 text-[18px] font-bold text-[#333438]">Uploaded Jobs</h2>
+        <h2 className="mb-4 font-display text-[20px] font-bold text-slate-900">Uploaded Jobs</h2>
         <Card className="overflow-hidden">
           {isLoading ? (
             <div className="flex justify-center py-12">
@@ -91,25 +91,25 @@ export default function UploadJobPage() {
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full min-w-[860px] border-collapse text-left">
-                <thead className="bg-[#f5f6f8]">
+                <thead className="table-head">
                   <tr>
                     {["Job Title", "Client", "Upload Date", "Status", "Candidates Matched", "View Matches"].map((header) => (
-                      <th className="px-5 py-4 text-[12px] font-bold uppercase tracking-[0.06em] text-[#9ca0a8]" key={header}>
+                      <th className="px-5 py-4" key={header}>
                         {header}
                       </th>
                     ))}
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-[#edf0f3]">
+                <tbody className="divide-y divide-slate-100">
                   {jobs.map((job) => {
                     const id = getJobId(job);
                     return (
-                      <tr key={id || getJobTitle(job)}>
-                        <td className="px-5 py-4 text-[14px] font-bold text-[#333438]">
+                      <tr className="transition-colors hover:bg-brand-faint/40" key={id || getJobTitle(job)}>
+                        <td className="px-5 py-4 text-[14px] font-semibold text-slate-900">
                           {getJobTitle(job)}
                         </td>
-                        <td className="px-5 py-4 text-[14px] text-[#77777a]">{getClient(job)}</td>
-                        <td className="px-5 py-4 text-[14px] text-[#77777a]">{formatDate(job.created_at)}</td>
+                        <td className="px-5 py-4 text-[14px] text-slate-500">{getClient(job)}</td>
+                        <td className="px-5 py-4 text-[14px] text-slate-500">{formatDate(job.created_at)}</td>
                         <td className="px-5 py-4">
                           <Badge tone={statusTone(job.status)}>{job.status ?? "Open"}</Badge>
                         </td>
@@ -143,15 +143,15 @@ export default function UploadJobPage() {
 
 function RecentJobCard({ job }: { job: Job }) {
   return (
-    <div className="rounded-[8px] border border-[#E5E7EB] px-4 py-4">
+    <div className="rounded-xl border border-slate-100 bg-slate-50/50 px-4 py-4 transition hover:bg-white hover:shadow-sm">
       <div className="flex gap-4">
         <FileText className="mt-1 h-5 w-5 shrink-0 text-crimson-700" />
         <div className="min-w-0">
-          <p className="truncate text-[14px] font-bold text-[#333438]">
+          <p className="truncate text-[14px] font-semibold text-slate-900">
             {getJobTitle(job)}
           </p>
-          <p className="mt-1 truncate text-[12px] text-[#77777a]">{getClient(job)}</p>
-          <p className="mt-1 text-[12px] text-[#a0a4ac]">{formatDate(job.created_at)}</p>
+          <p className="mt-1 truncate text-[12px] text-slate-500">{getClient(job)}</p>
+          <p className="mt-1 text-[12px] text-slate-400">{formatDate(job.created_at)}</p>
           <p className="mt-2 inline-flex items-center gap-1 text-[12px] font-bold text-[#00a650]">
             <CheckCircle2 className="h-4 w-4" />
             Processed

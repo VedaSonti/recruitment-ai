@@ -14,18 +14,18 @@ export function StatCard({
   value: ReactNode;
 }) {
   return (
-    <Card className="px-6 py-5">
+    <Card className="px-6 py-5 transition duration-200 hover:-translate-y-0.5 hover:shadow-lift">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <p className="text-[14px] leading-5 text-[#333438]">{label}</p>
-          <p className="mt-2 text-[32px] font-bold leading-none text-crimson-700">
+          <p className="text-[13px] font-medium uppercase tracking-[0.06em] text-slate-500">{label}</p>
+          <p className="mt-2 font-display text-[32px] font-bold leading-none tracking-[-0.04em] text-brand-dark">
             {value}
           </p>
         </div>
         <span
           className={cx(
-            "flex h-6 w-6 items-center justify-center rounded-full text-white",
-            accent === "crimson" && "bg-crimson-700",
+            "flex h-8 w-8 items-center justify-center rounded-xl text-white shadow-sm",
+            accent === "crimson" && "bg-brand",
             accent === "green" && "bg-[#06c95e]",
             accent === "amber" && "bg-[#ff6b00]",
             accent === "red" && "bg-[#ff1717]",
