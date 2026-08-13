@@ -15,6 +15,7 @@ import {
   LogOut,
   Users,
 } from "lucide-react";
+import { PersonaLogo } from "@/components/branding/PersonaLogo";
 import { getJobs, logoutRecruiter, type RecruiterUser } from "@/src/lib/api";
 import { getJobId } from "@/src/lib/utils";
 
@@ -70,13 +71,7 @@ export function Sidebar({ recruiter }: { recruiter: RecruiterUser | null }) {
   return (
     <aside className="sidebar-bg flex h-screen w-[252px] shrink-0 flex-col text-white shadow-2xl shadow-slate-950/20">
       <div className="border-b border-white/10 px-6 py-7">
-        <div className="flex items-center gap-3">
-          <span className="font-display text-[30px] font-black leading-none tracking-[-0.08em] text-brand">
-            iSOFT
-          </span>
-          <span className="font-display text-[19px] font-bold tracking-[-0.02em]">Recruitment</span>
-        </div>
-        <p className="mt-2 text-[12px] font-medium uppercase tracking-[0.09em] text-white/50">AI-Powered Matching</p>
+        <PersonaLogo className="w-full max-w-[196px]" priority tone="onDark" />
       </div>
 
       <nav className="flex-1 space-y-1.5 overflow-y-auto px-3 py-5">

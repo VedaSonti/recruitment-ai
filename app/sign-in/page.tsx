@@ -13,6 +13,7 @@ import {
   ShieldCheck,
   Sparkles,
 } from "lucide-react";
+import { PersonaLogo } from "@/components/branding/PersonaLogo";
 import { Button } from "@/components/ui/Button";
 import { getCurrentRecruiter, isAPIError, loginRecruiter } from "@/src/lib/api";
 
@@ -71,7 +72,7 @@ export default function SignInPage() {
             <div className="absolute bottom-12 right-[-80px] h-80 w-80 rotate-12 rounded-[48px] border border-brand/45" />
           </div>
 
-          <BrandMark />
+          <BrandMark onDark />
 
           <div className="relative my-auto max-w-[520px] py-14">
             <div className="mb-7 inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/[0.08] px-4 py-2 text-[12px] font-semibold tracking-wide text-white/90 backdrop-blur">
@@ -100,7 +101,7 @@ export default function SignInPage() {
         <main className="flex min-h-screen items-center justify-center px-5 py-8 sm:px-8 lg:px-12 xl:px-20">
           <div className="signin-card w-full max-w-[470px]">
             <div className="mb-10 lg:hidden">
-              <BrandMark dark />
+              <BrandMark />
             </div>
 
             <div className="mb-9">
@@ -216,16 +217,18 @@ export default function SignInPage() {
   );
 }
 
-function BrandMark({ dark = false }: { dark?: boolean }) {
+function BrandMark({ onDark = false }: { onDark?: boolean }) {
   return (
     <Link
-      aria-label="iSOFT Recruitment home"
-      className={`relative inline-flex items-center gap-3 self-start font-display ${dark ? "text-slate-900" : "text-white"}`}
+      aria-label="Persona home"
+      className="relative inline-flex self-start"
       href="/sign-in"
     >
-      <span className="text-[29px] font-black leading-none tracking-[-0.08em] text-brand">iSOFT</span>
-      <span className={`h-6 w-px ${dark ? "bg-brand/20" : "bg-white/25"}`} />
-      <span className="text-[17px] font-bold">Recruitment</span>
+      <PersonaLogo
+        className="w-[230px] max-w-full"
+        priority
+        tone={onDark ? "onDark" : "default"}
+      />
     </Link>
   );
 }

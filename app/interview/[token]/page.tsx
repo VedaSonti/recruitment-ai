@@ -19,6 +19,7 @@ import {
   Video,
   Volume2,
 } from "lucide-react";
+import { PersonaLogo } from "@/components/branding/PersonaLogo";
 
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 const MAX_RECORDING_SECONDS = 30;
@@ -1133,7 +1134,7 @@ export default function InterviewPage() {
           Your interview responses have been submitted successfully. The recruitment team will
           review your answers and be in touch soon.
         </p>
-        <p className="mt-8 text-sm text-gray-400">iSOFT Recruitment</p>
+        <PersonaLogo className="mt-8 w-[180px]" />
       </Screen>
     );
   }
@@ -1144,9 +1145,7 @@ export default function InterviewPage() {
     return (
       <Screen>
         <div className="w-full max-w-xl rounded-2xl border border-gray-200 bg-white p-8 shadow-sm">
-          <p className="mb-2 text-sm font-semibold uppercase tracking-wider text-[#7B1111]">
-            iSOFT Recruitment
-          </p>
+          <PersonaLogo className="mb-2 w-[210px] max-w-full" priority />
           <h1 className="text-2xl font-bold text-gray-900">AI Interview</h1>
           <p className="mt-1 text-gray-500">{interview.job_title}</p>
 
