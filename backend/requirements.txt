@@ -16,3 +16,4 @@ reportlab
 argon2-cffi
 PyJWT
 email-validator
+weaviate-client==4.22.0

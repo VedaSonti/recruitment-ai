@@ -598,6 +598,15 @@ export async function getInterviewByMatch(matchId: string): Promise<{
   });
 }
 
+export function runMatchingAnalysis(jobId: string): Promise<{
+  job_id: string;
+  matched_candidates: number;
+}> {
+  return request(`/matches/run/${encodeURIComponent(jobId)}`, {
+    method: "POST",
+  });
+}
+
 export type ObservationAnalysisStatus =
   | "no_recording"
   | "pending"

@@ -17,6 +17,7 @@ Then open in your browser:
 This gives you an interactive page to test every endpoint without Postman.
 """
 
+import asyncio
 import os
 import re
 import base64
@@ -65,6 +66,15 @@ from recording_observations import (
     recording_analysis_startup_status,
     unavailable_recording_observations,
 )
+from weaviate_service import (
+    close_weaviate,
+    connect_to_weaviate,
+    ensure_collections as ensure_weaviate_collections,
+    insert_candidate_vector,
+    insert_job_vector,
+    search_candidates as search_weaviate_candidates,
+    search_jobs as search_weaviate_jobs,
+)
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -97,6 +107,9 @@ CANDIDATE_FILE_KEY_PREFIX = PurePosixPath("media/candidates")
 
 CHAT_MODEL = "gpt-4o-mini"
 EMBED_MODEL = "text-embedding-3-small"
+VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "mongodb").strip().lower()
+if VECTOR_BACKEND not in {"mongodb", "weaviate"}:
+    raise RuntimeError("VECTOR_BACKEND must be either 'mongodb' or 'weaviate'")
 
 def interview_video_storage_key(interview_id, question_index: int) -> str:
     """Return the portable media key stored with an interview response."""
@@ -585,6 +598,109 @@ def build_vector_search_pipeline(query_vector: list[float], result_limit: int) -
     ]
 
 
+async def search_candidate_vectors(
+    query_vector: list[float], result_limit: int
+) -> list[dict]:
+    """Return candidate Mongo documents in vector-score order."""
+    if VECTOR_BACKEND == "mongodb":
+        pipeline = build_vector_search_pipeline(query_vector, result_limit)
+        return await candidates_collection.aggregate(pipeline).to_list(length=None)
+
+    vector_results = await asyncio.to_thread(
+        search_weaviate_candidates, query_vector, weaviate_overfetch_limit(result_limit)
+    )
+    hydrated = await hydrate_vector_results(
+        vector_results, "candidate_id", candidates_collection
+    )
+    return hydrated[:result_limit]
+
+
+async def search_job_vectors(
+    query_vector: list[float], result_limit: int
+) -> list[dict]:
+    """Return job Mongo documents in vector-score order."""
+    if VECTOR_BACKEND == "mongodb":
+        pipeline = build_vector_search_pipeline(query_vector, result_limit)
+        return await jobs_collection.aggregate(pipeline).to_list(length=None)
+
+    vector_results = await asyncio.to_thread(
+        search_weaviate_jobs, query_vector, weaviate_overfetch_limit(result_limit)
+    )
+    hydrated = await hydrate_vector_results(vector_results, "job_id", jobs_collection)
+    return hydrated[:result_limit]
+
+
+def weaviate_overfetch_limit(result_limit: int) -> int:
+    """Allow Mongo hydration to discard orphaned vector records safely."""
+    return max(100, result_limit * 5)
+
+
+async def hydrate_vector_results(
+    vector_results: list[dict], id_field: str, collection
+) -> list[dict]:
+    """Hydrate Weaviate IDs from Mongo while preserving ranking and scores."""
+    ranked_ids = [
+        ObjectId(item[id_field])
+        for item in vector_results
+        if ObjectId.is_valid(item.get(id_field, ""))
+    ]
+    if not ranked_ids:
+        return []
+
+    documents = await collection.find({"_id": {"$in": ranked_ids}}).to_list(
+        length=None
+    )
+    by_id = {document["_id"]: document for document in documents}
+    hydrated = []
+    for item in vector_results:
+        raw_id = item.get(id_field, "")
+        if not ObjectId.is_valid(raw_id):
+            continue
+        document = by_id.get(ObjectId(raw_id))
+        if document is not None:
+            hydrated.append({**document, "score": item.get("score", 0)})
+    return hydrated
+
+
+async def match_candidates_for_job(job_id: ObjectId, job: dict) -> int:
+    """Persist current vector matches for one existing MongoDB job."""
+    candidate_count = await candidates_collection.count_documents({})
+    print(f"[matching] backend={VECTOR_BACKEND}")
+    print(f"[matching] job_id={job_id}")
+    if not candidate_count:
+        print("[matching] vector_results=0")
+        print("[matching] hydrated_candidates=0")
+        print("[matching] persisted_matches=0")
+        return 0
+
+    embedding = job.get("embedding") or []
+    if not embedding:
+        raise HTTPException(422, "Job does not contain a searchable embedding")
+
+    if VECTOR_BACKEND == "weaviate":
+        vector_results = await asyncio.to_thread(
+            search_weaviate_candidates,
+            embedding,
+            weaviate_overfetch_limit(candidate_count),
+        )
+        print(f"[matching] vector_results={len(vector_results)}")
+        top_candidates = await hydrate_vector_results(
+            vector_results, "candidate_id", candidates_collection
+        )
+        top_candidates = top_candidates[:candidate_count]
+    else:
+        top_candidates = await search_candidate_vectors(embedding, candidate_count)
+        print(f"[matching] vector_results={len(top_candidates)}")
+
+    print(f"[matching] hydrated_candidates={len(top_candidates)}")
+    persisted_matches = 0
+    for candidate in top_candidates:
+        await upsert_match(job_id, candidate["_id"], candidate.get("score", 0))
+        persisted_matches += 1
+    print(f"[matching] persisted_matches={persisted_matches}")
+    return persisted_matches
+
+
 async def upsert_match(job_id: ObjectId, candidate_id: ObjectId, match_score: float) -> None:
     now = datetime.now(timezone.utc)
     match_filter = {"job_id": job_id, "candidate_id": candidate_id}
@@ -663,6 +779,19 @@ async def ensure_match_uniqueness() -> None:
         expireAfterSeconds=0,
         name="expire_password_reset_tokens",
     )
+    if VECTOR_BACKEND == "weaviate":
+        try:
+            await asyncio.to_thread(connect_to_weaviate)
+            await asyncio.to_thread(ensure_weaviate_collections)
+        except Exception:
+            await asyncio.to_thread(close_weaviate)
+            raise
+
+
+@app.on_event("shutdown")
+async def close_vector_backend() -> None:
+    if VECTOR_BACKEND == "weaviate":
+        await asyncio.to_thread(close_weaviate)
 
 
 def validate_upload_extension(filename: Optional[str]) -> str:
@@ -2685,9 +2814,15 @@ async def upload_job(
         job_id = result.inserted_id
         created_job_ids.append(str(job_id))
 
+        if VECTOR_BACKEND == "weaviate":
+            await asyncio.to_thread(
+                insert_job_vector, job_id, job_doc, embedding
+            )
+
         if existing_candidate_count:
-            pipeline = build_vector_search_pipeline(embedding, existing_candidate_count)
-            top_candidates = await candidates_collection.aggregate(pipeline).to_list(length=None)
+            top_candidates = await search_candidate_vectors(
+                embedding, existing_candidate_count
+            )
             matched_candidate_count += len(top_candidates)
 
             for candidate in top_candidates:
@@ -2742,12 +2877,16 @@ async def upload_candidate(file: UploadFile = File(...)):
         file.filename,
     )
 
+    if VECTOR_BACKEND == "weaviate":
+        await asyncio.to_thread(
+            insert_candidate_vector, candidate_id, candidate_doc, embedding
+        )
+
     existing_job_count = await jobs_collection.count_documents({})
     top_jobs = []
 
     if existing_job_count:
-        pipeline = build_vector_search_pipeline(embedding, existing_job_count)
-        top_jobs = await jobs_collection.aggregate(pipeline).to_list(length=None)
+        top_jobs = await search_job_vectors(embedding, existing_job_count)
 
         for job in top_jobs:
             await upsert_match(job["_id"], candidate_id, job.get("score", 0))
@@ -2783,6 +2922,20 @@ async def get_matches_by_job(job_id: str):
         })
     enriched.sort(key=lambda x: x["score"], reverse=True)
     return {"job_id": job_id, "ranked_candidates": enriched}
+
+
+@app.post("/matches/run/{job_id}", dependencies=[Depends(get_current_recruiter)])
+async def run_matching_analysis(job_id: str):
+    """Re-run vector matching for an existing job and persist the matches."""
+    if not ObjectId.is_valid(job_id):
+        raise HTTPException(400, "Invalid job id")
+    object_id = ObjectId(job_id)
+    job = await jobs_collection.find_one({"_id": object_id})
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    persisted_matches = await match_candidates_for_job(object_id, job)
+    return {"job_id": job_id, "matched_candidates": persisted_matches}
 
 
 @app.get("/matches/by-candidate/{candidate_id}", dependencies=[Depends(get_current_recruiter)])
