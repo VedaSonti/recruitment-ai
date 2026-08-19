@@ -108,7 +108,14 @@ export interface SkillMatch {
     | "category_alias"
     | "embedding_similarity"
     | "no_candidate_skills"
-    | "no_match";
+    | "no_match"
+    | "resume_evidence"
+    | "controlled_transferable_evidence"
+    | "no_direct_resume_evidence";
+  classification?: "matched" | "experience_backed_match" | "transferable" | "gap";
+  evidence_sources?: string[];
+  evidence?: string[];
+  confidence?: "high" | "medium" | "low";
 }
 
 export interface SkillAnalysis {

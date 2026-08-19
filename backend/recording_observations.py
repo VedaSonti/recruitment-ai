@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import wave
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -594,6 +595,50 @@ aggregate_speaker_segments = aggregate_diarization_segments
 _speaker_pipeline = None
 _speaker_pipeline_model = None
 _speaker_pipeline_lock = threading.Lock()
+_torchcodec_status_reported = False
+
+
+def _import_speaker_pipeline_class():
+    """Import pyannote while containing its optional decoder warning only."""
+    global _torchcodec_status_reported
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"\ntorchcodec is not installed correctly so built-in audio decoding will fail\..*",
+            category=UserWarning,
+            module=r"pyannote\.audio\.core\.io",
+        )
+        from pyannote.audio import Pipeline
+        from pyannote.audio.core import io as pyannote_audio_io
+
+    if (
+        not getattr(pyannote_audio_io, "TORCHCODEC_AVAILABLE", False)
+        and not _torchcodec_status_reported
+    ):
+        print(
+            "[speaker analysis] TorchCodec unavailable; "
+            "using the configured in-memory waveform input."
+        )
+        _torchcodec_status_reported = True
+    return Pipeline
+
+
+def _validate_speaker_minimum_samples(pipeline) -> int | None:
+    """Run pyannote's one-time minimum-length probe under its exact known warning."""
+    embedding = getattr(pipeline, "_embedding", None)
+    if embedding is None:
+        return None
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"std\(\): degrees of freedom is <= 0\..*",
+            category=UserWarning,
+            module=r"pyannote\.audio\.models\.blocks\.pooling",
+        )
+        minimum_samples = getattr(embedding, "min_num_samples", None)
+    if minimum_samples is not None and int(minimum_samples) <= 0:
+        raise RuntimeError("speaker embedding minimum sample length is invalid")
+    return int(minimum_samples) if minimum_samples is not None else None
 
 
 def _load_speaker_pipeline():
@@ -604,10 +649,10 @@ def _load_speaker_pipeline():
     ).strip()
     if _speaker_pipeline is not None and _speaker_pipeline_model == model_name:
         return _speaker_pipeline
-    from pyannote.audio import Pipeline
 
     with _speaker_pipeline_lock:
         if _speaker_pipeline is None or _speaker_pipeline_model != model_name:
+            Pipeline = _import_speaker_pipeline_class()
             pipeline = Pipeline.from_pretrained(model_name, token=token)
             if pipeline is None:
                 raise RuntimeError("speaker pipeline was not loaded")
@@ -617,6 +662,7 @@ def _load_speaker_pipeline():
                 if not torch.cuda.is_available():
                     raise RuntimeError("CUDA was requested but is unavailable")
                 pipeline.to(torch.device("cuda"))
+            _validate_speaker_minimum_samples(pipeline)
             _speaker_pipeline = pipeline
             _speaker_pipeline_model = model_name
     return _speaker_pipeline
@@ -665,27 +711,38 @@ def analyze_speakers(
     video_path: str, config: ObservationConfig = DEFAULT_CONFIG
 ) -> dict:
     started = time.monotonic()
+    timing = {
+        "ffmpeg_seconds": 0.0,
+        "speaker_model_load_seconds": 0.0,
+        "speaker_inference_seconds": 0.0,
+    }
+
+    def finish(result: dict) -> dict:
+        result["analysis_duration_seconds"] = _round(time.monotonic() - started, 2)
+        result["_timing"] = {
+            name: round(seconds, 3) for name, seconds in timing.items()
+        }
+        return result
+
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         result = aggregate_diarization_segments([], 0, config)
         result.update(status="model_unavailable", status_reason="FFmpeg is unavailable for diarisation audio extraction.")
-        result["analysis_duration_seconds"] = _round(time.monotonic() - started, 2)
-        return result
+        return finish(result)
     if not _package_available("pyannote.audio"):
         result = aggregate_diarization_segments([], 0, config)
         result.update(status="model_unavailable", status_reason="The pyannote.audio package is not installed in the backend environment.")
-        result["analysis_duration_seconds"] = _round(time.monotonic() - started, 2)
-        return result
+        return finish(result)
     if not os.getenv("HUGGINGFACE_TOKEN", "").strip():
         result = aggregate_diarization_segments([], 0, config)
         result.update(status="model_unavailable", status_reason="Speaker diarisation is not configured because the backend Hugging Face token is missing.")
-        result["analysis_duration_seconds"] = _round(time.monotonic() - started, 2)
-        return result
+        return finish(result)
 
     temporary_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temporary:
             temporary_path = temporary.name
+        ffmpeg_started = time.monotonic()
         completed = subprocess.run(
             [ffmpeg, "-v", "error", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", temporary_path],
             capture_output=True,
@@ -693,30 +750,50 @@ def analyze_speakers(
             check=False,
         )
         if completed.returncode != 0:
+            timing["ffmpeg_seconds"] = time.monotonic() - ffmpeg_started
             result = aggregate_diarization_segments([], 0, config)
             result.update(status="failed", status_reason="Audio could not be extracted for speaker diarisation.")
         else:
             waveform_input, duration = _load_pcm_waveform(temporary_path)
-            try:
-                pipeline = _load_speaker_pipeline()
-            except Exception as model_error:
-                print(f"[speaker analysis] Diarisation model load failed error_type={type(model_error).__name__}")
+            timing["ffmpeg_seconds"] = time.monotonic() - ffmpeg_started
+            if duration < config.min_total_speech_seconds:
                 result = aggregate_diarization_segments([], duration, config)
                 result.update(
-                    status="model_unavailable",
-                    status_reason="The configured speaker diarisation model could not be loaded. Confirm model access and backend configuration.",
+                    status="insufficient_audio",
+                    status_reason="The recording is too short to satisfy the minimum speech-duration rule.",
                 )
             else:
                 try:
-                    with _speaker_pipeline_lock:
-                        output = pipeline(waveform_input)
-                    result = aggregate_diarization_segments(
-                        _diarization_segments(output), duration, config
+                    model_load_started = time.monotonic()
+                    pipeline = _load_speaker_pipeline()
+                    timing["speaker_model_load_seconds"] = (
+                        time.monotonic() - model_load_started
                     )
-                except Exception as analysis_error:
-                    print(f"[speaker analysis] Diarisation failed error_type={type(analysis_error).__name__}")
+                except Exception as model_error:
+                    print(f"[speaker analysis] Diarisation model load failed error_type={type(model_error).__name__}")
                     result = aggregate_diarization_segments([], duration, config)
-                    result.update(status="failed", status_reason="Speaker diarisation failed for this recording.")
+                    result.update(
+                        status="model_unavailable",
+                        status_reason="The configured speaker diarisation model could not be loaded. Confirm model access and backend configuration.",
+                    )
+                else:
+                    try:
+                        inference_started = time.monotonic()
+                        with _speaker_pipeline_lock:
+                            output = pipeline(waveform_input)
+                        timing["speaker_inference_seconds"] = (
+                            time.monotonic() - inference_started
+                        )
+                        result = aggregate_diarization_segments(
+                            _diarization_segments(output), duration, config
+                        )
+                    except Exception as analysis_error:
+                        timing["speaker_inference_seconds"] = (
+                            time.monotonic() - inference_started
+                        )
+                        print(f"[speaker analysis] Diarisation failed error_type={type(analysis_error).__name__}")
+                        result = aggregate_diarization_segments([], duration, config)
+                        result.update(status="failed", status_reason="Speaker diarisation failed for this recording.")
     except Exception as audio_error:
         print(f"[speaker analysis] Audio preparation failed error_type={type(audio_error).__name__}")
         result = aggregate_diarization_segments([], 0, config)
@@ -724,15 +801,31 @@ def analyze_speakers(
     finally:
         if temporary_path:
             Path(temporary_path).unlink(missing_ok=True)
-    result["analysis_duration_seconds"] = _round(time.monotonic() - started, 2)
-    return result
+    return finish(result)
 
 
 def analyze_recording(video_path: str, config: ObservationConfig = DEFAULT_CONFIG) -> dict:
+    started = time.monotonic()
+    head_started = time.monotonic()
+    head = analyze_head_pose(video_path, config)
+    head_seconds = time.monotonic() - head_started
+    speaker = analyze_speakers(video_path, config)
+    speaker_timing = speaker.pop("_timing", {})
     return {
         "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
-        "head_orientation": analyze_head_pose(video_path, config),
-        "speaker_observations": analyze_speakers(video_path, config),
+        "head_orientation": head,
+        "speaker_observations": speaker,
+        "_timing": {
+            "ffmpeg_seconds": speaker_timing.get("ffmpeg_seconds", 0.0),
+            "head_analysis_seconds": round(head_seconds, 3),
+            "speaker_model_load_seconds": speaker_timing.get(
+                "speaker_model_load_seconds", 0.0
+            ),
+            "speaker_inference_seconds": speaker_timing.get(
+                "speaker_inference_seconds", 0.0
+            ),
+            "analysis_total_seconds": round(time.monotonic() - started, 3),
+        },
     }
 
 

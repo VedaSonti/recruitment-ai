@@ -27,6 +27,7 @@ import tempfile
 import io
 from pathlib import Path, PurePosixPath
 import secrets
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from bson import ObjectId
@@ -417,6 +418,68 @@ def _normalize_alias_dictionary(raw_aliases: dict[str, list[str]]) -> dict[str, 
 
 SKILL_ALIASES = _normalize_alias_dictionary(_RAW_SKILL_ALIASES)
 
+_DIRECT_EVIDENCE_ALIASES = {
+    "ai ml": {
+        "artificial intelligence", "machine learning", "ai engineer", "ml engineer",
+        "natural language processing", "nlp", "computer vision", "deep learning",
+    },
+    "apis": {
+        "api", "rest api", "rest APIs", "restful api", "fastapi",
+        "api integration", "api service", "api services",
+    },
+    "api": {
+        "apis", "rest api", "rest APIs", "restful api", "fastapi",
+        "api integration", "api service", "api services",
+    },
+    "ci cd": {
+        "github actions", "continuous integration", "continuous deployment",
+        "deployment pipeline", "deployment pipelines",
+    },
+    "generative ai": {
+        "llm", "llms", "large language model", "large language models",
+        "openai api", "prompt engineering", "llm powered", "llm application",
+    },
+    "semantic matching": {
+        "semantic matching", "semantic match pipeline", "semantic matching pipeline",
+    },
+    "backend integration": {
+        "fastapi", "backend integration", "api integration", "backend api",
+    },
+}
+
+_TRANSFERABLE_EVIDENCE_ALIASES = {
+    "devops": {
+        "github actions", "continuous integration", "continuous deployment",
+        "ci cd", "deployment pipeline", "deployment pipelines",
+    },
+    "azure": {"aws", "amazon web services", "gcp", "google cloud platform"},
+    "azure cloud": {"aws", "amazon web services", "gcp", "google cloud platform"},
+    "azure cloud architecture": {
+        "aws", "amazon web services", "gcp", "google cloud platform",
+        "cloud architecture",
+    },
+    "azure devops": {
+        "github actions", "continuous integration", "continuous deployment", "ci cd",
+    },
+    "data architecture": {
+        "data engineering", "etl", "elt", "mongodb", "postgresql", "postgres",
+    },
+    "data platform": {
+        "data engineering", "etl", "elt", "mongodb", "postgresql", "postgres",
+    },
+}
+
+_DIRECT_EVIDENCE_ONLY_SKILLS = {
+    "microsoft copilot studio",
+    "copilot studio",
+    "azure ai foundry",
+    "snowflake",
+    "power bi",
+    "powerbi",
+    "power automate",
+    "azure ai services",
+}
+
 
 def skill_alias_terms(skill: str) -> set[str]:
     normalized = normalize_skill(skill)
@@ -452,6 +515,87 @@ def find_alias_skill_match(required_skill: str, candidate_skills: list[str]) -> 
     return None
 
 
+def build_candidate_skill_evidence(candidate: dict) -> list[dict]:
+    """Collect factual, source-labelled resume text for deterministic matching."""
+    evidence = []
+
+    def add(source: str, value) -> None:
+        text = str(value or "").strip()
+        if text:
+            evidence.append({"source": source, "text": text})
+
+    for skill in candidate.get("skills") or []:
+        add("technical_skills", skill)
+    add("professional_summary", candidate.get("summary"))
+    for role in candidate.get("work_experience") or []:
+        add("professional_experience", role.get("title"))
+        for highlight in role.get("highlights") or []:
+            add("professional_experience", highlight)
+    for project in candidate.get("projects") or []:
+        if isinstance(project, dict):
+            add("projects", project.get("name"))
+            add("projects", project.get("description"))
+            for technology in project.get("technologies") or []:
+                add("projects", technology)
+            for highlight in project.get("highlights") or []:
+                add("projects", highlight)
+        else:
+            add("projects", project)
+    for achievement in candidate.get("key_achievements") or []:
+        add("professional_experience", achievement)
+    for certification in candidate.get("certifications") or []:
+        add("certifications", certification)
+    for line in re.split(r"[\r\n]+", candidate.get("cv_raw") or ""):
+        add("full_resume", line)
+    return evidence
+
+
+def _evidence_matches(terms: set[str], evidence: list[dict]) -> list[dict]:
+    normalized_terms = {normalize_skill(term) for term in terms if normalize_skill(term)}
+    matches = []
+    for item in evidence:
+        normalized_text = f" {normalize_skill(item.get('text', ''))} "
+        if any(f" {term} " in normalized_text for term in normalized_terms):
+            matches.append(item)
+    return matches
+
+
+def find_resume_evidence(required_skill: str, evidence: list[dict]) -> dict | None:
+    normalized_required = normalize_skill(required_skill)
+    terms = {normalized_required}
+    terms.update(_DIRECT_EVIDENCE_ALIASES.get(normalized_required, set()))
+    matches = _evidence_matches(terms, evidence)
+    if not matches:
+        return None
+    return {
+        "matched_with": required_skill,
+        "evidence_sources": list(dict.fromkeys(item["source"] for item in matches)),
+        "evidence": [item["text"] for item in matches[:3]],
+    }
+
+
+def find_transferable_resume_evidence(
+    required_skill: str, evidence: list[dict]
+) -> dict | None:
+    normalized_required = normalize_skill(required_skill)
+    terms = _TRANSFERABLE_EVIDENCE_ALIASES.get(normalized_required, set())
+    matches = _evidence_matches(terms, evidence)
+    if not matches:
+        return None
+    matched_term = next(
+        (
+            term for term in sorted(terms)
+            if _evidence_matches({term}, matches)
+        ),
+        "related experience",
+    )
+    return {
+        "closest_match": matched_term,
+        "evidence_sources": list(dict.fromkeys(item["source"] for item in matches)),
+        "evidence": [item["text"] for item in matches[:3]],
+    }
+
+
 def log_skill_alias_diagnostic(
     required_skill: str,
     normalized_required: str,
@@ -476,11 +620,13 @@ def build_skill_analysis_result(
     cand_skills: list[str],
     job_embeddings: list[list[float]] | None = None,
     cand_embeddings: list[list[float]] | None = None,
+    candidate_evidence: list[dict] | None = None,
 ) -> dict:
     matched = []
     partial = []
     missing = []
     candidate_normalized_skills = [normalize_skill(skill) for skill in cand_skills]
+    candidate_evidence = candidate_evidence or []
 
     for i, job_skill in enumerate(job_skills):
         normalized_required = normalize_skill(job_skill)
@@ -491,7 +637,11 @@ def build_skill_analysis_result(
                 "matched_with": exact_match,
                 "similarity": 1.0,
                 "type": "strong",
+                "classification": "matched",
                 "match_reason": "exact_normalized",
+                "evidence_sources": ["technical_skills"],
+                "evidence": [exact_match],
+                "confidence": "high",
             })
             log_skill_alias_diagnostic(
                 job_skill,
@@ -509,7 +659,11 @@ def build_skill_analysis_result(
                 "matched_with": alias_match,
                 "similarity": 1.0,
                 "type": "strong",
+                "classification": "matched",
                 "match_reason": "category_alias",
+                "evidence_sources": ["technical_skills"],
+                "evidence": [alias_match],
+                "confidence": "high",
             })
             log_skill_alias_diagnostic(
                 job_skill,
@@ -518,6 +672,49 @@ def build_skill_analysis_result(
                 True,
                 alias_match,
             )
+            continue
+
+        resume_match = find_resume_evidence(job_skill, candidate_evidence)
+        if resume_match:
+            matched.append({
+                "required": job_skill,
+                "matched_with": resume_match["matched_with"],
+                "similarity": 1.0,
+                "type": "strong",
+                "classification": "experience_backed_match",
+                "match_reason": "resume_evidence",
+                "evidence_sources": resume_match["evidence_sources"],
+                "evidence": resume_match["evidence"],
+                "confidence": "high",
+            })
+            continue
+
+        transferable_match = find_transferable_resume_evidence(
+            job_skill, candidate_evidence
+        )
+        if transferable_match:
+            partial.append({
+                "required": job_skill,
+                "closest_match": transferable_match["closest_match"],
+                "similarity": 0.7,
+                "type": "partial",
+                "classification": "transferable",
+                "match_reason": "controlled_transferable_evidence",
+                "evidence_sources": transferable_match["evidence_sources"],
+                "evidence": transferable_match["evidence"],
+                "confidence": "medium",
+            })
+            continue
+
+        if normalized_required in _DIRECT_EVIDENCE_ONLY_SKILLS:
+            missing.append({
+                "required": job_skill,
+                "closest_match": None,
+                "similarity": 0,
+                "type": "missing",
+                "classification": "gap",
+                "match_reason": "no_direct_resume_evidence",
+            })
             continue
 
         best_score = 0.0
@@ -543,7 +740,9 @@ def build_skill_analysis_result(
                 "matched_with": best_cand_skill,
                 "similarity": round(best_score, 3),
                 "type": "strong",
+                "classification": "matched",
                 "match_reason": "embedding_similarity",
+                "confidence": "medium",
             })
         elif best_score >= 0.65:
             partial.append({
@@ -551,7 +750,9 @@ def build_skill_analysis_result(
                 "closest_match": best_cand_skill,
                 "similarity": round(best_score, 3),
                 "type": "partial",
+                "classification": "transferable",
                 "match_reason": "embedding_similarity",
+                "confidence": "medium",
             })
         else:
             missing.append({
@@ -559,7 +760,9 @@ def build_skill_analysis_result(
                 "closest_match": best_cand_skill,
                 "similarity": round(best_score, 3),
                 "type": "missing",
+                "classification": "gap",
                 "match_reason": "embedding_similarity" if best_cand_skill else "no_match",
+                "confidence": "high",
             })
 
     semantic_score = round(
@@ -898,11 +1101,14 @@ async def analyse_match(match_id: str):
     # Build the analysis prompt
     job_skills = job.get("required_skills", [])
     cand_skills = candidate.get("skills", [])
+    candidate_evidence = build_candidate_skill_evidence(candidate)
     job_years = job.get("min_years_experience") or 0
     cand_years = candidate.get("years_experience") or 0
 
     # Calculate skill coverage: exact normalized match, alias/category match, then embeddings.
-    skill_analysis = build_skill_analysis_result(match_id, job_skills, cand_skills)
+    skill_analysis = build_skill_analysis_result(
+        match_id, job_skills, cand_skills, candidate_evidence=candidate_evidence
+    )
     if job_skills and cand_skills:
         try:
             expanded_job_skills = [expand_skill_abbreviations(s) for s in job_skills]
@@ -920,6 +1126,7 @@ async def analyse_match(match_id: str):
                 cand_skills,
                 job_embeddings,
                 cand_embeddings,
+                candidate_evidence,
             )
         except Exception:
             # Keep deterministic exact/alias results if embedding fallback is unavailable.
@@ -1068,8 +1275,9 @@ async def get_skill_analysis(match_id: str):
 
     job_skills = job.get("required_skills", [])
     cand_skills = candidate.get("skills", [])
+    candidate_evidence = build_candidate_skill_evidence(candidate)
 
-    if not job_skills or not cand_skills:
+    if not job_skills:
         result = {
             "match_id": match_id,
             "semantic_skill_score": 0,
@@ -1090,24 +1298,33 @@ async def get_skill_analysis(match_id: str):
         )
         return result
 
-    # Embed all skills in one batch call - cheaper than one call per skill
-    # Expand abbreviations before embedding for better semantic matching
-    expanded_job_skills = [expand_skill_abbreviations(s) for s in job_skills]
-    expanded_cand_skills = [expand_skill_abbreviations(s) for s in cand_skills]
-    all_skills = expanded_job_skills + expanded_cand_skills
-    embed_response = client.embeddings.create(model=EMBED_MODEL, input=all_skills)
-    embeddings = [r.embedding for r in embed_response.data]
-
-    job_embeddings = embeddings[:len(job_skills)]
-    cand_embeddings = embeddings[len(job_skills):]
-
     result = build_skill_analysis_result(
         match_id,
         job_skills,
         cand_skills,
-        job_embeddings,
-        cand_embeddings,
+        candidate_evidence=candidate_evidence,
     )
+    if cand_skills:
+        try:
+            # Embed all skills in one batch call for the existing semantic fallback.
+            expanded_job_skills = [expand_skill_abbreviations(s) for s in job_skills]
+            expanded_cand_skills = [expand_skill_abbreviations(s) for s in cand_skills]
+            all_skills = expanded_job_skills + expanded_cand_skills
+            embed_response = client.embeddings.create(model=EMBED_MODEL, input=all_skills)
+            embeddings = [r.embedding for r in embed_response.data]
+            job_embeddings = embeddings[:len(job_skills)]
+            cand_embeddings = embeddings[len(job_skills):]
+            result = build_skill_analysis_result(
+                match_id,
+                job_skills,
+                cand_skills,
+                job_embeddings,
+                cand_embeddings,
+                candidate_evidence,
+            )
+        except Exception:
+            # Deterministic explicit, resume-evidence, and alias matches remain usable.
+            pass
 
     # Cache on the match document so subsequent calls are instant
     await matches_collection.update_one(
@@ -1611,6 +1828,7 @@ def extract_video_frames(video_path: str, num_frames: int = 6) -> list[str]:
 
     Returns empty list if OpenCV is unavailable or video cannot be read.
     """
+    cap = None
     try:
         import cv2
         cap = cv2.VideoCapture(video_path)
@@ -1623,7 +1841,6 @@ def extract_video_frames(video_path: str, num_frames: int = 6) -> list[str]:
         duration_sec = total_frames / fps
 
         if total_frames == 0 or duration_sec < 1:
-            cap.release()
             return []
 
         # Skip the first 1 second (candidate settling) and last 1 second
@@ -1636,11 +1853,26 @@ def extract_video_frames(video_path: str, num_frames: int = 6) -> list[str]:
             for i in range(num_frames)
         ] if num_frames > 1 else [duration_sec / 2]
 
+        # Read forward instead of seeking by timestamp. Browser-generated VP9
+        # WebMs commonly expose a 1/1000 time base and no average frame rate.
+        # OpenCV can decode them sequentially but CAP_PROP_POS_MSEC seeks fail.
         frames_b64 = []
-        for t in sample_times:
-            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+        next_sample_index = 0
+        frame_index = 0
+        fallback_fps = fps if 1 <= fps <= 240 else 30.0
+        while next_sample_index < len(sample_times):
             ret, frame = cap.read()
             if not ret:
+                break
+
+            decoded_time = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0) / 1000.0
+            timestamp = (
+                decoded_time
+                if decoded_time > 0 or frame_index == 0
+                else frame_index / fallback_fps
+            )
+            frame_index += 1
+            if timestamp + 1e-6 < sample_times[next_sample_index]:
                 continue
 
             # Resize to reduce payload size - 480p is enough for presentation analysis
@@ -1660,8 +1892,8 @@ def extract_video_frames(video_path: str, num_frames: int = 6) -> list[str]:
                 frames_b64.append(
                     base64.b64encode(buffer).decode("utf-8")
                 )
+            next_sample_index += 1
 
-        cap.release()
         print(f"[video] Extracted {len(frames_b64)} frames from {duration_sec:.1f}s video")
         return frames_b64
 
@@ -1671,6 +1903,30 @@ def extract_video_frames(video_path: str, num_frames: int = 6) -> list[str]:
     except Exception as e:
         print(f"[video] Frame extraction error: {e}")
         return []
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+def backfill_missing_video_frames(
+    responses: list[dict], num_frames: int = 6
+) -> list[dict]:
+    """Recover legacy empty frame snapshots from the unchanged stored recording."""
+    updated = []
+    for response in responses:
+        next_response = dict(response)
+        if not next_response.get("frames_b64"):
+            recording_path = resolve_stored_interview_video_path(next_response)
+            if recording_path and recording_path.is_file():
+                frames_b64 = extract_video_frames(str(recording_path), num_frames=num_frames)
+                if frames_b64:
+                    next_response["frames_b64"] = frames_b64
+                    print(
+                        "[video] Backfilled sampled frames "
+                        f"q={next_response.get('question_index')} frames={len(frames_b64)}"
+                    )
+        updated.append(next_response)
+    return updated
 
 
 
@@ -1958,6 +2214,13 @@ def merge_recording_observations(
         )
         head = recording.get("head_orientation") or {}
         speaker = recording.get("speaker_observations") or {}
+        sampled_frames = int(head.get("sampled_frame_count") or 0)
+        valid_face_frames = int(head.get("valid_face_frame_count") or 0)
+        if head.get("status") == "completed" and sampled_frames:
+            item["video_observations"]["face_visible_percentage"] = round(
+                valid_face_frames / sampled_frames * 100,
+                1,
+            )
         item["video_observations"]["head_orientation"] = head
         item["video_observations"]["speaker_observations"] = speaker
         all_heads.append(head)
@@ -2004,8 +2267,12 @@ def merge_recording_observations(
     overall = dict(merged.get("video_observations") or {})
     overall["environment_observations"] = environment
     quality = dict(overall.get("recording_quality") or {})
+    if coverage is not None:
+        quality["face_visible_percentage"] = coverage
     if any(item.get("multiple_faces_detected") is True for item in all_heads):
         quality["multiple_faces_detected"] = True
+    elif all_heads and completed_heads == len(all_heads):
+        quality["multiple_faces_detected"] = False
     overall["recording_quality"] = quality
     merged["video_observations"] = overall
     merged["per_response_observations"] = per_response
@@ -2033,10 +2300,10 @@ async def assess_interview_with_video(token: str):
             "cv_consistency": interview.get("cv_consistency"),
         }
 
-    responses = interview.get("responses", [])
+    responses = backfill_missing_video_frames(interview.get("responses", []))
     stored_has_frames = any(response.get("frames_b64") for response in responses)
-    stale_unavailable_with_frames = (
-        interview.get("video_analysis_status") == "unavailable"
+    stale_failed_or_unavailable_with_frames = (
+        interview.get("video_analysis_status") in ("failed", "unavailable")
         and stored_has_frames
     )
     stale_observation_schema = (
@@ -2047,7 +2314,7 @@ async def assess_interview_with_video(token: str):
     if (
         interview.get("assessment")
         and interview.get("video_analysis_status") in ("completed", "failed", "unavailable")
-        and not stale_unavailable_with_frames
+        and not stale_failed_or_unavailable_with_frames
         and not stale_observation_schema
     ):
         return {
@@ -2071,6 +2338,13 @@ async def assess_interview_with_video(token: str):
     ])
 
     recording_observations_by_question = {}
+    observation_timing_totals = {
+        "ffmpeg_seconds": 0.0,
+        "head_analysis_seconds": 0.0,
+        "speaker_model_load_seconds": 0.0,
+        "speaker_inference_seconds": 0.0,
+        "analysis_total_seconds": 0.0,
+    }
     for response in responses:
         question_index = response.get("question_index")
         recording_path = resolve_stored_interview_video_path(response)
@@ -2093,6 +2367,11 @@ async def assess_interview_with_video(token: str):
                     "failed",
                     "Optional presentation and speaker analysis failed; transcript, score, and playback remain available.",
                 )
+        observation_timing = recording_observations.pop("_timing", {})
+        for timing_name in observation_timing_totals:
+            observation_timing_totals[timing_name] += float(
+                observation_timing.get(timing_name, 0.0) or 0.0
+            )
         recording_observations_by_question[question_index] = recording_observations
         head = recording_observations.get("head_orientation") or {}
         speaker = recording_observations.get("speaker_observations") or {}
@@ -2349,6 +2628,7 @@ Return ONLY valid JSON:
             cv_consistency = {"error": "CV consistency check could not be completed"}
 
     now = datetime.now(timezone.utc)
+    persistence_started = time.monotonic()
     await interviews_collection.update_one(
         {"token": token},
         {"$set": {
@@ -2365,6 +2645,20 @@ Return ONLY valid JSON:
     await matches_collection.update_one(
         {"_id": interview["match_id"]},
         {"$set": {"status": "Interview Completed", "updated_at": now}}
+    )
+    persistence_seconds = time.monotonic() - persistence_started
+    observation_total_seconds = (
+        observation_timing_totals["analysis_total_seconds"] + persistence_seconds
+    )
+    print(
+        "[recording observations timing] "
+        f"interview_id={interview['_id']} responses={len(responses)} "
+        f"ffmpeg_seconds={observation_timing_totals['ffmpeg_seconds']:.3f} "
+        f"head_analysis_seconds={observation_timing_totals['head_analysis_seconds']:.3f} "
+        f"speaker_model_load_seconds={observation_timing_totals['speaker_model_load_seconds']:.3f} "
+        f"speaker_inference_seconds={observation_timing_totals['speaker_inference_seconds']:.3f} "
+        f"persistence_seconds={persistence_seconds:.3f} "
+        f"total_seconds={observation_total_seconds:.3f}"
     )
 
     return {

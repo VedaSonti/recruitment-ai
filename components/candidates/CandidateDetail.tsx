@@ -603,7 +603,10 @@ function SemanticSkillSections({ analysis }: { analysis: SkillAnalysis }) {
   return (
     <div className="space-y-5">
       <div>
-        <p className="mb-3 text-[12px] font-bold uppercase tracking-[0.08em] text-[#04743b]">Matched Skills</p>
+        <p className="mb-3 flex items-center gap-2 text-[12px] font-bold uppercase tracking-[0.08em] text-[#04743b]">
+          Matched Skills
+          <span title="Matched skills include skills explicitly listed or demonstrated through professional experience and projects."><CircleHelp className="h-3.5 w-3.5" /></span>
+        </p>
         <div className="flex flex-wrap gap-2">
           {analysis.matched.length ? analysis.matched.map((item) => (
             <span className="inline-flex items-center gap-1.5 rounded-full bg-[#d9f8e5] px-3 py-1.5 text-[13px] font-bold text-[#04743b]" key={item.required} title={`Matched with candidate's ${item.matched_with ?? "skill"} (${Math.round(item.similarity * 100)}% similar)`}>

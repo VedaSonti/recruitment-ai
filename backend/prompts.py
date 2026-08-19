@@ -72,6 +72,8 @@ Rules:
 - For notice_period: if stated, extract it (e.g. '2 weeks', '1 month', 'immediate').
   If not mentioned, use null.
 - For work_experience: extract each role as a separate object. If not present, return [].
+- For projects: extract concrete projects, technologies, and outcomes. If not present, return [].
+- For certifications: extract only certifications explicitly stated. If not present, return [].
 - For education: extract each qualification. If not present, return [].
 - For key_achievements: extract 3-5 standout bullet points from the CV. If none, return [].
 
@@ -97,6 +99,15 @@ Shape:
       "highlights": ["key achievement or responsibility"]
     }}
   ],
+  "projects": [
+    {{
+      "name": "project name",
+      "description": "what was built",
+      "technologies": ["explicitly stated technology"],
+      "highlights": ["concrete project outcome or responsibility"]
+    }}
+  ],
+  "certifications": ["certification exactly as stated"],
   "education": [
     {{
       "degree": "B.Sc. Computer Science",

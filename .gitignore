@@ -13,3 +13,5 @@ backend/models/**/*.tflite
 backend/models/**/*.onnx
 backend/.venv/
 tmp/
+output/presentations/
+screenshots/recruitment-ai/

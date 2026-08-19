@@ -5,8 +5,9 @@ import sys
 import tempfile
 import types
 import unittest
+import warnings
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import recording_observations as observations
 from recording_observations import (
@@ -181,24 +182,109 @@ class SpeakerDiarizationTests(unittest.TestCase):
         self.assertEqual(waveform["waveform"].dimension, 0)
         self.assertAlmostEqual(duration, 2.0)
 
+    def test_speaker_pipeline_is_loaded_and_calibrated_once(self):
+        class FakeEmbedding:
+            reads = 0
+
+            @property
+            def min_num_samples(self):
+                self.reads += 1
+                warnings.warn_explicit(
+                    "std(): degrees of freedom is <= 0. test",
+                    UserWarning,
+                    "pooling.py",
+                    93,
+                    module="pyannote.audio.models.blocks.pooling",
+                )
+                return 640
+
+        pipeline = types.SimpleNamespace(_embedding=FakeEmbedding())
+        fake_pipeline_class = types.SimpleNamespace(
+            from_pretrained=Mock(return_value=pipeline)
+        )
+        with patch.object(
+            observations, "_speaker_pipeline", None
+        ), patch.object(
+            observations, "_speaker_pipeline_model", None
+        ), patch.object(
+            observations,
+            "_import_speaker_pipeline_class",
+            return_value=fake_pipeline_class,
+        ), patch.dict(
+            os.environ,
+            {
+                "HUGGINGFACE_TOKEN": "test-token",
+                "SPEAKER_DIARIZATION_MODEL": "test-model",
+                "SPEAKER_DIARIZATION_DEVICE": "cpu",
+            },
+            clear=False,
+        ), warnings.catch_warnings(record=True) as caught:
+            first = observations._load_speaker_pipeline()
+            second = observations._load_speaker_pipeline()
+
+        self.assertIs(first, pipeline)
+        self.assertIs(second, pipeline)
+        fake_pipeline_class.from_pretrained.assert_called_once()
+        self.assertEqual(pipeline._embedding.reads, 1)
+        self.assertFalse(any("degrees of freedom" in str(item.message) for item in caught))
+
+    def test_recording_shorter_than_minimum_skips_model_inference(self):
+        with patch.object(observations.shutil, "which", return_value="ffmpeg"), patch.object(
+            observations, "_package_available", return_value=True
+        ), patch.object(
+            observations.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)
+        ), patch.object(
+            observations,
+            "_load_pcm_waveform",
+            return_value=({"waveform": "test", "sample_rate": 16000}, 1.0),
+        ), patch.object(
+            observations, "_load_speaker_pipeline"
+        ) as load_pipeline, patch.dict(
+            os.environ, {"HUGGINGFACE_TOKEN": "test-token"}, clear=False
+        ):
+            result = observations.analyze_speakers("recording.webm", CONFIG)
+
+        self.assertEqual(result["status"], "insufficient_audio")
+        load_pipeline.assert_not_called()
+
+    def test_recording_uses_only_in_memory_waveform_for_inference(self):
+        pipeline = Mock(return_value=[])
+        waveform = {"waveform": object(), "sample_rate": 16000}
+        with patch.object(observations.shutil, "which", return_value="ffmpeg"), patch.object(
+            observations, "_package_available", return_value=True
+        ), patch.object(
+            observations.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)
+        ), patch.object(
+            observations, "_load_pcm_waveform", return_value=(waveform, 30.0)
+        ), patch.object(
+            observations, "_load_speaker_pipeline", return_value=pipeline
+        ), patch.dict(
+            os.environ, {"HUGGINGFACE_TOKEN": "test-token"}, clear=False
+        ):
+            result = observations.analyze_speakers("recording.webm", CONFIG)
+
+        pipeline.assert_called_once_with(waveform)
+        self.assertNotIn("audio", pipeline.call_args.args[0])
+        self.assertEqual(result["status"], "insufficient_audio")
+
     def test_single_speaker(self):
-        segments = [speaker_segment(0, 1.2, "SPEAKER_00"), speaker_segment(1.3, 3.5, "SPEAKER_00")]
-        result = aggregate_diarization_segments(segments, 4.0, CONFIG)
+        segments = [speaker_segment(0, 12, "SPEAKER_00"), speaker_segment(12.3, 29.5, "SPEAKER_00")]
+        result = aggregate_diarization_segments(segments, 30.0, CONFIG)
         self.assertEqual(result["estimated_speaker_count"], 1)
         self.assertFalse(result["possible_additional_speaker"])
 
     def test_two_speakers_sequentially(self):
-        segments = [speaker_segment(0, 4, "SPEAKER_00"), speaker_segment(4.2, 6.2, "SPEAKER_01")]
-        result = aggregate_diarization_segments(segments, 7.0, CONFIG)
+        segments = [speaker_segment(0, 22, "SPEAKER_00"), speaker_segment(22.2, 29.5, "SPEAKER_01")]
+        result = aggregate_diarization_segments(segments, 30.0, CONFIG)
         self.assertEqual(result["estimated_speaker_count"], 2)
         self.assertTrue(result["possible_additional_speaker"])
         self.assertEqual(result["possible_second_speaker_intervals"][0]["speaker_label"], "SPEAKER_01")
 
     def test_two_speakers_overlapping(self):
-        segments = [speaker_segment(0, 4, "SPEAKER_00"), speaker_segment(2.5, 5, "SPEAKER_01")]
-        result = aggregate_diarization_segments(segments, 5.0, CONFIG)
+        segments = [speaker_segment(0, 29.5, "SPEAKER_00"), speaker_segment(12.5, 17.5, "SPEAKER_01")]
+        result = aggregate_diarization_segments(segments, 30.0, CONFIG)
         self.assertTrue(result["overlapping_speech_detected"])
-        self.assertAlmostEqual(result["overlapping_speech_seconds"], 1.5, delta=0.1)
+        self.assertAlmostEqual(result["overlapping_speech_seconds"], 5.0, delta=0.1)
 
     def test_background_noise_without_speech_is_insufficient(self):
         result = aggregate_diarization_segments([], 5.0, CONFIG)
@@ -283,6 +369,29 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(per_response["video_observations"]["filler_word_count"], 0)
         self.assertEqual(per_response["video_observations"]["head_orientation"]["status"], "failed")
         self.assertEqual(response["video_url"], "/video")
+
+    def test_completed_head_analysis_populates_deterministic_visibility(self):
+        merge = load_merge_function()
+        response = {"question_index": 0, "question": "Q", "transcript": "Answer"}
+        analysis = {
+            "video_analysis_status": "failed",
+            "video_observations": {"recording_quality": {}},
+            "per_response_observations": [],
+        }
+        recording = unavailable_recording_observations("failed", "unused")
+        recording["head_orientation"].update(
+            status="completed",
+            sampled_frame_count=20,
+            valid_face_frame_count=15,
+            multiple_faces_detected=False,
+        )
+
+        result = merge(analysis, [response], {0: recording})
+        quality = result["video_observations"]["recording_quality"]
+        per_response = result["per_response_observations"][0]["video_observations"]
+        self.assertEqual(quality["face_visible_percentage"], 75.0)
+        self.assertFalse(quality["multiple_faces_detected"])
+        self.assertEqual(per_response["face_visible_percentage"], 75.0)
 
     def test_observations_do_not_modify_scores(self):
         merge = load_merge_function()

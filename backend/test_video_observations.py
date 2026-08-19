@@ -1,7 +1,11 @@
 import ast
+import base64
 import re
+import sys
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 def load_video_helpers():
@@ -21,6 +25,8 @@ def load_video_helpers():
         "build_unavailable_video_analysis",
         "normalize_video_analysis_payload",
         "apply_video_observations_to_responses",
+        "extract_video_frames",
+        "backfill_missing_video_frames",
     }
     assignment_names = {
         "VIDEO_QUALITY_VALUES",
@@ -41,7 +47,7 @@ def load_video_helpers():
 
     module = ast.Module(body=nodes, type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace = {"re": re}
+    namespace = {"re": re, "base64": base64}
     exec(compile(module, str(source_path), "exec"), namespace)
     return namespace
 
@@ -51,6 +57,8 @@ normalize_video_analysis_payload = helpers["normalize_video_analysis_payload"]
 build_unavailable_video_analysis = helpers["build_unavailable_video_analysis"]
 apply_video_observations_to_responses = helpers["apply_video_observations_to_responses"]
 contains_prohibited_video_observation_term = helpers["contains_prohibited_video_observation_term"]
+extract_video_frames = helpers["extract_video_frames"]
+backfill_missing_video_frames = helpers["backfill_missing_video_frames"]
 
 
 def sample_response(transcript="I built the API, um, and tested the deployment."):
@@ -112,6 +120,74 @@ def sample_raw(**overrides):
 
 
 class VideoObservationSafetyTests(unittest.TestCase):
+    def test_vp9_style_video_is_sampled_sequentially_without_timestamp_seeks(self):
+        class Frame:
+            shape = (480, 640, 3)
+
+        class Capture:
+            def __init__(self):
+                self.read_calls = 0
+                self.release_calls = 0
+
+            def isOpened(self):
+                return True
+
+            def get(self, prop):
+                if prop == fake_cv2.CAP_PROP_FRAME_COUNT:
+                    return 30000
+                if prop == fake_cv2.CAP_PROP_FPS:
+                    return 1000
+                if prop == fake_cv2.CAP_PROP_POS_MSEC:
+                    return max(0, self.read_calls - 1) * 500
+                return 0
+
+            def read(self):
+                if self.read_calls >= 61:
+                    return False, None
+                self.read_calls += 1
+                return True, Frame()
+
+            def release(self):
+                self.release_calls += 1
+
+        capture = Capture()
+        fake_cv2 = types.SimpleNamespace(
+            CAP_PROP_FRAME_COUNT=1,
+            CAP_PROP_FPS=2,
+            CAP_PROP_POS_MSEC=3,
+            IMWRITE_JPEG_QUALITY=4,
+            VideoCapture=lambda path: capture,
+            flip=lambda frame, axis: frame,
+            resize=lambda frame, size: frame,
+            imencode=lambda extension, frame, options: (True, b"jpeg"),
+        )
+        with patch.dict(sys.modules, {"cv2": fake_cv2}):
+            frames = extract_video_frames("response.webm", num_frames=6)
+
+        self.assertEqual(len(frames), 6)
+        self.assertGreater(capture.read_calls, 6)
+        self.assertEqual(capture.release_calls, 1)
+
+    def test_missing_stored_frames_are_backfilled_without_replacing_recording(self):
+        recording = Path(__file__)
+        original_resolver = helpers.get("resolve_stored_interview_video_path")
+        original_extractor = helpers.get("extract_video_frames")
+        helpers["resolve_stored_interview_video_path"] = lambda response: recording
+        helpers["extract_video_frames"] = lambda path, num_frames=6: ["frame-1", "frame-2"]
+        response = {"question_index": 0, "video_storage_key": "interviews/id/0.webm"}
+        try:
+            result = backfill_missing_video_frames([response])
+        finally:
+            if original_resolver is None:
+                helpers.pop("resolve_stored_interview_video_path", None)
+            else:
+                helpers["resolve_stored_interview_video_path"] = original_resolver
+            helpers["extract_video_frames"] = original_extractor
+
+        self.assertEqual(result[0]["frames_b64"], ["frame-1", "frame-2"])
+        self.assertEqual(result[0]["video_storage_key"], response["video_storage_key"])
+        self.assertNotIn("frames_b64", response)
+
     def test_normal_visible_candidate_with_clear_audio(self):
         result = normalize_video_analysis_payload(sample_raw(), [sample_response()])
         quality = result["video_observations"]["recording_quality"]
