@@ -1,4 +1,6 @@
---extra-index-url https://download.pytorch.org/whl/cpu
+--find-links https://download.pytorch.org/whl/cpu/torch/
+--find-links https://download.pytorch.org/whl/cpu/torchaudio/
+--find-links https://download.pytorch.org/whl/cpu/torchcodec/
 
 fastapi
 uvicorn
