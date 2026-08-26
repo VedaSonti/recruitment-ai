@@ -21,7 +21,7 @@ import {
 } from "lucide-react";
 import { PersonaLogo } from "@/components/branding/PersonaLogo";
 
-const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
+const BASE_URL = process.env.NEXT_PUBLIC_API_URL?.trim() || "/api/backend";
 const MAX_RECORDING_SECONDS = 30;
 const VIDEO_FRAME_TIMEOUT_MS = 5000;
 const VIDEO_MIME_TYPES = [

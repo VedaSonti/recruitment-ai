@@ -1,10 +1,6 @@
-const rawBaseUrl = process.env.NEXT_PUBLIC_API_URL;
-
-if (!rawBaseUrl) {
-  throw new Error("NEXT_PUBLIC_API_URL is not configured.");
-}
-
-const API_BASE_URL = rawBaseUrl.replace(/\/+$/, "");
+const API_BASE_URL = (
+  process.env.NEXT_PUBLIC_API_URL?.trim() || "/api/backend"
+).replace(/\/+$/, "");
 
 export type MatchStatus =
   | "Uploaded"
