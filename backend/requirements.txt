@@ -1,3 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 fastapi
 uvicorn
 motor
@@ -11,6 +13,8 @@ pypdf
 Pillow
 opencv-contrib-python==5.0.0.93
 mediapipe==1.0.0
+torch==2.11.0+cpu
+torchaudio==2.11.0+cpu
 pyannote.audio==4.0.7
 reportlab
 argon2-cffi

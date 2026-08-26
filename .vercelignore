@@ -1,0 +1,25 @@
+# Local build and dependency directories
+node_modules/
+.next/
+.venv/
+backend/.venv/
+backend/venv/
+
+# Python caches and local tool caches
+**/__pycache__/
+**/*.py[cod]
+backend/.cache/
+backend/**/.cache/
+
+# Runtime uploads and generated media are external application data, not code.
+backend/media/
+backend/uploads/
+backend/CVs/
+backend/Job Descriptions/
+backend/datasets/
+backend/generated/
+
+# Local development output
+tmp/
+screenshots/
+output/
