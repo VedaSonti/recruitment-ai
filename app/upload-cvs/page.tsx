@@ -2,47 +2,33 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { CheckCircle2, FileText } from "lucide-react";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { Badge } from "@/components/ui/Badge";
-import { Button } from "@/components/ui/Button";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { LoadingSpinner } from "@/components/ui/LoadingSpinner";
+import { MatchingAction } from "@/components/upload/MatchingAction";
 import { UploadWorkflow } from "@/components/upload/UploadWorkflow";
 import {
   getCandidates,
   getJobs,
-  runMatchingAnalysis,
   uploadCandidate,
   type Candidate,
+  type Job,
 } from "@/src/lib/api";
-import { formatDate, getCandidateId, getJobId } from "@/src/lib/utils";
+import { formatDate, getCandidateId } from "@/src/lib/utils";
 
 export default function UploadCvsPage() {
-  const router = useRouter();
   const [candidates, setCandidates] = useState<Candidate[]>([]);
-  const [mostRecentJobId, setMostRecentJobId] = useState("");
+  const [jobs, setJobs] = useState<Job[]>([]);
   const [processedCount, setProcessedCount] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
-  const [isMatching, setIsMatching] = useState(false);
-  const [matchingError, setMatchingError] = useState("");
-
-  const logMatching = useCallback((message: string, value?: unknown) => {
-    if (process.env.NODE_ENV !== "production") {
-      if (value === undefined) {
-        console.info(message);
-      } else {
-        console.info(message, value);
-      }
-    }
-  }, []);
 
   const loadData = useCallback(async () => {
     setIsLoading(true);
     const [candidateList, jobs] = await Promise.all([getCandidates(), getJobs()]);
     setCandidates(candidateList);
-    setMostRecentJobId(getJobId(jobs[0] ?? {}));
+    setJobs(jobs);
     setIsLoading(false);
   }, []);
 
@@ -57,37 +43,6 @@ export default function UploadCvsPage() {
     },
     [loadData],
   );
-
-  const handleRunMatching = useCallback(async () => {
-    logMatching("[matching-ui] button clicked");
-    logMatching("[matching-ui] selectedJobId=", mostRecentJobId);
-    logMatching("[matching-ui] candidatesLoaded=", candidates.length);
-    setMatchingError("");
-
-    if (!mostRecentJobId) {
-      const error = "No job is available for matching.";
-      logMatching("[matching-ui] request failed", error);
-      setMatchingError(error);
-      return;
-    }
-
-    setIsMatching(true);
-    try {
-      logMatching("[matching-ui] calling runMatchingAnalysis");
-      await runMatchingAnalysis(mostRecentJobId);
-      logMatching("[matching-ui] request completed");
-      router.push(`/matches/${encodeURIComponent(mostRecentJobId)}`);
-    } catch (requestError) {
-      const message =
-        requestError instanceof Error
-          ? requestError.message
-          : "Matching analysis could not be started.";
-      logMatching("[matching-ui] request failed", message);
-      setMatchingError(message);
-    } finally {
-      setIsMatching(false);
-    }
-  }, [candidates.length, logMatching, mostRecentJobId, router]);
 
   return (
     <>
@@ -106,35 +61,12 @@ export default function UploadCvsPage() {
             upload={uploadCandidate}
           />
 
-          {processedCount > 0 ? (
-            <section className="flex flex-col gap-4 rounded-2xl bg-brand px-6 py-5 text-white shadow-lg shadow-brand/15 md:flex-row md:items-center md:justify-between">
-              <p className="text-[16px] font-bold">
-                {"\u2713"} {processedCount} CV{processedCount === 1 ? "" : "s"} uploaded - match against all existing jobs?
-              </p>
-              {mostRecentJobId ? (
-                <div>
-                  <Button
-                    className="bg-white text-crimson-700 hover:bg-[#f8f8f8]"
-                    isLoading={isMatching}
-                    onClick={handleRunMatching}
-                    type="button"
-                    variant="secondary"
-                  >
-                    Run Matching Analysis
-                  </Button>
-                  {matchingError ? (
-                    <p className="mt-2 text-[13px] font-semibold text-white" role="alert">
-                      {matchingError}
-                    </p>
-                  ) : null}
-                </div>
-              ) : (
-                <p className="text-[14px] font-bold text-white/90">
-                  Upload job descriptions first before running matching
-                </p>
-              )}
-            </section>
-          ) : null}
+          <MatchingAction
+            candidateCount={candidates.length}
+            isLoading={isLoading}
+            jobs={jobs}
+            processedCount={processedCount}
+          />
         </div>
 
         <Card className="self-start px-6 py-6">

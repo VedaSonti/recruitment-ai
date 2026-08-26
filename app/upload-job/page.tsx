@@ -7,8 +7,10 @@ import { PageHeader } from "@/components/layout/PageHeader";
 import { Badge, statusTone } from "@/components/ui/Badge";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { LoadingSpinner } from "@/components/ui/LoadingSpinner";
+import { MatchingAction } from "@/components/upload/MatchingAction";
 import { UploadWorkflow } from "@/components/upload/UploadWorkflow";
 import {
+  getCandidates,
   getJobs,
   getMatchesByJob,
   uploadJob,
@@ -18,12 +20,13 @@ import { formatDate, getClient, getJobId, getJobTitle } from "@/src/lib/utils";
 
 export default function UploadJobPage() {
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [candidateCount, setCandidateCount] = useState(0);
   const [matchCounts, setMatchCounts] = useState<Record<string, number>>({});
   const [isLoading, setIsLoading] = useState(true);
 
-  const loadJobs = useCallback(async () => {
+  const loadData = useCallback(async () => {
     setIsLoading(true);
-    const nextJobs = await getJobs();
+    const [nextJobs, candidates] = await Promise.all([getJobs(), getCandidates()]);
     const counts = await Promise.all(
       nextJobs.map(async (job) => {
         const id = getJobId(job);
@@ -34,13 +37,14 @@ export default function UploadJobPage() {
       }),
     );
     setJobs(nextJobs);
+    setCandidateCount(candidates.length);
     setMatchCounts(Object.fromEntries(counts));
     setIsLoading(false);
   }, []);
 
   useEffect(() => {
-    loadJobs().catch(() => setIsLoading(false));
-  }, [loadJobs]);
+    loadData().catch(() => setIsLoading(false));
+  }, [loadData]);
 
   return (
     <>
@@ -55,8 +59,13 @@ export default function UploadJobPage() {
             dropTitle="Drag and drop your JD files here"
             helperText="PDF or DOCX - Multiple files supported"
             manualDetails
-            onProcessed={() => loadJobs()}
+            onProcessed={() => loadData()}
             upload={uploadJob}
+          />
+          <MatchingAction
+            candidateCount={candidateCount}
+            isLoading={isLoading}
+            jobs={jobs}
           />
         </div>
 
