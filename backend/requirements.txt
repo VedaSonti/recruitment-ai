@@ -23,3 +23,4 @@ argon2-cffi
 PyJWT
 email-validator
 weaviate-client==4.22.0
+vercel>=0.5.0,<1

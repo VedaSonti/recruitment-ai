@@ -30,12 +30,13 @@ import secrets
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from urllib.parse import quote
 from bson import ObjectId
 
 import numpy as np
 from PIL import Image
 from fastapi import Depends, FastAPI, UploadFile, File, HTTPException, Form
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pymongo.errors import DuplicateKeyError
@@ -61,6 +62,7 @@ from db import (
 from auth import get_current_recruiter, router as auth_router
 from email_service import send_email
 from profile_pdf import generate_profile_pdf
+from object_storage import ObjectStorage
 from recording_observations import (
     OBSERVATION_SCHEMA_VERSION,
     analyze_recording,
@@ -105,6 +107,10 @@ if not _configured_candidate_media_root.is_absolute():
     _configured_candidate_media_root = BACKEND_DIR / _configured_candidate_media_root
 CANDIDATE_MEDIA_ROOT = _configured_candidate_media_root.resolve()
 CANDIDATE_FILE_KEY_PREFIX = PurePosixPath("media/candidates")
+CANDIDATE_CV_STORAGE = ObjectStorage(
+    local_root=CANDIDATE_MEDIA_ROOT,
+    key_prefix=CANDIDATE_FILE_KEY_PREFIX,
+)
 
 CHAT_MODEL = "gpt-4o-mini"
 EMBED_MODEL = "text-embedding-3-small"
@@ -225,6 +231,12 @@ def candidate_cv_storage_key(candidate_id: ObjectId, filename: str) -> str:
     if suffix not in {".pdf", ".docx"}:
         suffix = ".bin"
     return str(CANDIDATE_FILE_KEY_PREFIX / str(candidate_id) / f"original{suffix}")
+
+
+def candidate_cv_content_type(filename: Optional[str]) -> str:
+    if Path(filename or "").suffix.lower() == ".pdf":
+        return "application/pdf"
+    return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
 def resolve_candidate_cv_storage_key(storage_key: str) -> Optional[Path]:
@@ -1058,13 +1070,6 @@ async def save_uploaded_file_to_temp(upload_file: UploadFile) -> tuple[str, str,
         raise
 
 
-def _remove_file_best_effort(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-    except OSError as exc:
-        print(f"[candidate upload] Could not remove incomplete original CV {path}: {exc}")
-
-
 async def persist_candidate_with_original_cv(
     candidate_doc: dict,
     original_cv_bytes: bytes,
@@ -1076,26 +1081,36 @@ async def persist_candidate_with_original_cv(
         candidate_id,
         original_filename or "candidate.pdf",
     )
-    original_cv_path = resolve_candidate_cv_storage_key(original_cv_key)
-    if not original_cv_path:
-        raise HTTPException(500, "Could not create a safe original CV storage path")
-
     try:
-        original_cv_path.parent.mkdir(parents=True, exist_ok=True)
-        original_cv_path.write_bytes(original_cv_bytes)
-    except OSError as exc:
-        _remove_file_best_effort(original_cv_path)
+        stored_original = await CANDIDATE_CV_STORAGE.put_bytes(
+            original_cv_key,
+            original_cv_bytes,
+            content_type=candidate_cv_content_type(original_filename),
+        )
+    except Exception as exc:
+        print(f"[candidate upload] Original CV object upload failed: {type(exc).__name__}")
         raise HTTPException(500, "Could not safely store the original CV") from exc
 
     candidate_with_original = {
         **candidate_doc,
         "_id": candidate_id,
-        "original_cv_storage_key": original_cv_key,
+        "original_cv_storage_key": stored_original.key,
+        "original_cv_storage_backend": stored_original.backend,
+        "original_cv_storage_url": stored_original.url,
     }
     try:
         await candidates_collection.insert_one(candidate_with_original)
     except Exception:
-        _remove_file_best_effort(original_cv_path)
+        try:
+            await CANDIDATE_CV_STORAGE.delete(
+                stored_original.key,
+                backend=stored_original.backend,
+            )
+        except Exception as cleanup_error:
+            print(
+                "[candidate upload] Could not remove orphaned original CV after "
+                f"candidate insert failure: {type(cleanup_error).__name__}"
+            )
         raise
 
     return candidate_id
@@ -2901,8 +2916,21 @@ async def prepare_profile_uplift(match_id: str):
         else None
     )
     original_key = candidate.get("original_cv_storage_key")
-    original_path = resolve_candidate_cv_storage_key(original_key) if original_key else None
-    original_available = bool(original_path and original_path.is_file())
+    original_backend = candidate.get("original_cv_storage_backend") or "local"
+    try:
+        original_available = bool(
+            original_key
+            and await CANDIDATE_CV_STORAGE.exists(
+                original_key,
+                backend=original_backend,
+            )
+        )
+    except Exception as exc:
+        print(
+            "[profile uplifting] Could not verify original CV availability: "
+            f"{type(exc).__name__}"
+        )
+        raise HTTPException(503, "Original CV storage is temporarily unavailable") from exc
     now = datetime.now(timezone.utc)
     new_profile = {
         "candidate_id": candidate["_id"],
@@ -2919,6 +2947,8 @@ async def prepare_profile_uplift(match_id: str):
         "original_cv_reference": {
             "source_file": candidate.get("source_file"),
             "storage_key": original_key,
+            "storage_backend": original_backend,
+            "storage_url": candidate.get("original_cv_storage_url"),
             "available": original_available,
         },
         "source_snapshot": {
@@ -3071,10 +3101,36 @@ async def download_original_cv(match_id: str):
     if not profile:
         raise HTTPException(404, "Profile not found")
     original = profile.get("original_cv_reference") or {}
-    original_path = resolve_candidate_cv_storage_key(original.get("storage_key"))
-    if not original_path or not original_path.is_file():
+    storage_key = original.get("storage_key")
+    storage_backend = original.get("storage_backend") or "local"
+    if not storage_key:
         raise HTTPException(404, "Original CV file is unavailable for this historical candidate")
-    return FileResponse(original_path, filename=original.get("source_file") or original_path.name)
+    try:
+        stored_original = await CANDIDATE_CV_STORAGE.get(
+            storage_key,
+            backend=storage_backend,
+            default_content_type=candidate_cv_content_type(original.get("source_file")),
+        )
+    except Exception as exc:
+        print(f"[profile uplifting] Original CV download failed: {type(exc).__name__}")
+        raise HTTPException(503, "Original CV storage is temporarily unavailable") from exc
+    if not stored_original:
+        raise HTTPException(404, "Original CV file is unavailable for this historical candidate")
+
+    filename = Path(original.get("source_file") or "candidate-cv").name
+    if stored_original.local_path:
+        return FileResponse(stored_original.local_path, filename=filename)
+
+    return StreamingResponse(
+        stored_original.stream,
+        media_type=stored_original.content_type,
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            **({"ETag": stored_original.etag} if stored_original.etag else {}),
+        },
+    )
 
 
 @app.post("/jobs/upload", dependencies=[Depends(get_current_recruiter)])
