@@ -16,6 +16,7 @@ SUPPORTED_STORAGE_BACKENDS = {
     LOCAL_STORAGE_BACKEND,
     VERCEL_BLOB_STORAGE_BACKEND,
 }
+_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 
 
 def configured_object_storage_backend() -> str:
@@ -211,30 +212,22 @@ class ObjectStorage:
 
         from vercel.blob import AsyncBlobClient
 
-        client = AsyncBlobClient()
-        try:
+        async with AsyncBlobClient() as client:
             result = await client.get(key, access="private")
-            if result is None or result.status_code != 200 or result.stream is None:
-                await client.aclose()
-                return None
-        except Exception:
-            await client.aclose()
-            raise
+        if result is None or result.status_code != 200:
+            return None
 
-        async def stream_with_cleanup() -> AsyncIterator[bytes]:
-            try:
-                async for chunk in result.stream:
-                    yield chunk
-            finally:
-                await client.aclose()
+        async def iter_content() -> AsyncIterator[bytes]:
+            for offset in range(0, len(result.content), _DOWNLOAD_CHUNK_SIZE):
+                yield result.content[offset : offset + _DOWNLOAD_CHUNK_SIZE]
 
         return StoredObjectDownload(
             backend=selected_backend,
             key=key,
-            content_type=result.blob.content_type or default_content_type,
-            stream=stream_with_cleanup(),
-            etag=result.blob.etag,
-            size=result.blob.size,
+            content_type=result.content_type or default_content_type,
+            stream=iter_content(),
+            etag=result.etag,
+            size=result.size,
         )
 
     async def materialize(
@@ -246,9 +239,51 @@ class ObjectStorage:
         default_content_type: str = "application/octet-stream",
     ) -> Optional[MaterializedStoredObject]:
         """Return a local path for processing without assuming durable storage is local."""
+        selected_backend = backend or self.backend
+        self._validated_key(key)
+        if selected_backend == VERCEL_BLOB_STORAGE_BACKEND:
+            from vercel.blob import AsyncBlobClient
+            from vercel.blob.errors import BlobNotFoundError
+
+            temporary_path: Optional[Path] = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
+                    temporary_path = Path(temporary.name)
+                async with AsyncBlobClient() as client:
+                    metadata = await client.head(key)
+                    await client.download_file(
+                        key,
+                        temporary_path,
+                        access="private",
+                        overwrite=True,
+                        create_parents=False,
+                    )
+                bytes_written = temporary_path.stat().st_size
+                if bytes_written != metadata.size:
+                    raise IOError("Stored object download size did not match its metadata")
+                download = StoredObjectDownload(
+                    backend=selected_backend,
+                    key=key,
+                    content_type=metadata.content_type or default_content_type,
+                    size=metadata.size,
+                )
+                return MaterializedStoredObject(
+                    download=download,
+                    path=temporary_path,
+                    temporary=True,
+                )
+            except BlobNotFoundError:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+                return None
+            except Exception:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+                raise
+
         download = await self.get(
             key,
-            backend=backend,
+            backend=selected_backend,
             default_content_type=default_content_type,
         )
         if download is None:

@@ -4,8 +4,11 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from unittest.mock import patch
+
+from vercel.blob import AsyncBlobClient, GetBlobResult, HeadBlobResult
 
 from object_storage import (
     LOCAL_STORAGE_BACKEND,
@@ -28,6 +31,27 @@ class ObjectStorageTests(unittest.TestCase):
             "vercel.blob": blob_module,
             "vercel.blob.errors": errors_module,
         }
+
+    def test_installed_sdk_download_contract(self):
+        self.assertEqual(
+            set(GetBlobResult.__dataclass_fields__),
+            {
+                "url",
+                "download_url",
+                "pathname",
+                "content_type",
+                "size",
+                "content_disposition",
+                "cache_control",
+                "uploaded_at",
+                "etag",
+                "content",
+                "status_code",
+            },
+        )
+        self.assertFalse(hasattr(GetBlobResult, "stream"))
+        self.assertFalse(hasattr(GetBlobResult, "blob"))
+        self.assertTrue(callable(AsyncBlobClient.download_file))
 
     def test_local_storage_round_trip_and_delete(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -132,25 +156,32 @@ class ObjectStorageTests(unittest.TestCase):
         self.assertEqual(events[1][3]["access"], "private")
         self.assertFalse(events[1][3]["overwrite"])
 
-    def test_private_blob_download_closes_client_after_streaming(self):
+    def test_private_blob_download_uses_sdk_content_and_closes_client(self):
         events = []
 
-        async def blob_stream():
-            yield b"part-1"
-            yield b"part-2"
-
         class FakeClient:
+            async def __aenter__(self):
+                events.append("enter")
+                return self
+
+            async def __aexit__(self, *_args):
+                events.append("exit")
+
             async def get(self, key, **options):
                 events.append(("get", key, options))
-                blob = types.SimpleNamespace(
+                return GetBlobResult(
+                    url=f"https://private/{key}",
+                    download_url=f"https://private/{key}?download=1",
+                    pathname=key,
                     content_type="application/pdf",
-                    etag="etag-1",
                     size=12,
+                    content_disposition="attachment",
+                    cache_control="private",
+                    uploaded_at=datetime.now(timezone.utc),
+                    etag="etag-1",
+                    content=b"part-1part-2",
+                    status_code=200,
                 )
-                return types.SimpleNamespace(status_code=200, stream=blob_stream(), blob=blob)
-
-            async def aclose(self):
-                events.append("close")
 
         async def download_all(storage, key):
             download = await storage.get(key, backend=VERCEL_BLOB_STORAGE_BACKEND)
@@ -174,28 +205,39 @@ class ObjectStorageTests(unittest.TestCase):
 
         self.assertEqual(contents, b"part-1part-2")
         self.assertEqual(download.content_type, "application/pdf")
-        self.assertEqual(events[0], ("get", key, {"access": "private"}))
-        self.assertEqual(events[-1], "close")
+        self.assertFalse(hasattr(GetBlobResult, "stream"))
+        self.assertFalse(hasattr(GetBlobResult, "blob"))
+        self.assertEqual(events[1], ("get", key, {"access": "private"}))
+        self.assertEqual(events[-1], "exit")
 
     def test_private_blob_materializes_to_a_temporary_file_and_closes_client(self):
         events = []
 
-        async def blob_stream():
-            yield b"video-"
-            yield b"bytes"
-
         class FakeClient:
-            async def get(self, key, **options):
-                events.append(("get", key, options))
-                blob = types.SimpleNamespace(
-                    content_type="video/webm",
-                    etag="etag-video",
-                    size=11,
-                )
-                return types.SimpleNamespace(status_code=200, stream=blob_stream(), blob=blob)
+            async def __aenter__(self):
+                events.append("enter")
+                return self
 
-            async def aclose(self):
-                events.append("close")
+            async def __aexit__(self, *_args):
+                events.append("exit")
+
+            async def head(self, key):
+                events.append(("head", key))
+                return HeadBlobResult(
+                    size=11,
+                    uploaded_at=datetime.now(timezone.utc),
+                    pathname=key,
+                    content_type="video/webm",
+                    content_disposition="attachment",
+                    url=f"https://private/{key}",
+                    download_url=f"https://private/{key}?download=1",
+                    cache_control="private",
+                )
+
+            async def download_file(self, key, local_path, **options):
+                events.append(("download_file", key, options))
+                Path(local_path).write_bytes(b"video-bytes")
+                return str(local_path)
 
         async def materialize(storage, key):
             result = await storage.materialize(
@@ -223,7 +265,10 @@ class ObjectStorageTests(unittest.TestCase):
 
         self.assertTrue(materialized.temporary)
         self.assertEqual(contents, b"video-bytes")
-        self.assertEqual(events[-1], "close")
+        self.assertEqual(events[1], ("head", key))
+        self.assertEqual(events[2][0:2], ("download_file", key))
+        self.assertEqual(events[2][2]["access"], "private")
+        self.assertEqual(events[-1], "exit")
 
 
 if __name__ == "__main__":
