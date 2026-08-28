@@ -19,8 +19,10 @@ def load_video_storage_helpers(media_root: Path):
         "interview_video_storage_key",
         "resolve_interview_video_storage_key",
         "resolve_stored_interview_video_path",
+        "validate_uploaded_interview_video_key",
         "response_has_video",
         "response_video_playback",
+        "parse_byte_range",
     }
     nodes = [
         node
@@ -39,6 +41,7 @@ def load_video_storage_helpers(media_root: Path):
         "Path": Path,
         "PurePosixPath": PurePosixPath,
         "re": re,
+        "VERCEL_BLOB_STORAGE_BACKEND": "vercel_blob",
     }
     exec(compile(module, str(source_path), "exec"), namespace)
     return namespace
@@ -90,6 +93,25 @@ class VideoStorageTests(unittest.TestCase):
             with self.subTest(storage_key=storage_key):
                 self.assertIsNone(resolve(storage_key))
 
+    def test_direct_blob_key_must_match_current_interview_and_question(self):
+        validate = self.helpers["validate_uploaded_interview_video_key"]
+        interview_id = "6a683d3dd22f99f70063f616"
+        self.assertTrue(validate(
+            f"media/interviews/{interview_id}/2-randomSuffix.webm",
+            interview_id,
+            2,
+        ))
+        self.assertFalse(validate(
+            f"media/interviews/{interview_id}/1-randomSuffix.webm",
+            interview_id,
+            2,
+        ))
+        self.assertFalse(validate(
+            "media/interviews/aaaaaaaaaaaaaaaaaaaaaaaa/2-randomSuffix.webm",
+            interview_id,
+            2,
+        ))
+
     def test_playback_url_is_returned_only_when_file_exists(self):
         storage_key = "media/interviews/6a683d3dd22f99f70063f616/0.webm"
         response = {
@@ -131,6 +153,29 @@ class VideoStorageTests(unittest.TestCase):
             self.helpers["response_video_playback"]("match123", response),
             (None, "historical_unavailable"),
         )
+
+    def test_private_blob_playback_is_available_without_a_local_file(self):
+        response = {
+            "question_index": 0,
+            "video_storage_key": (
+                "media/interviews/6a683d3dd22f99f70063f616/0-random.webm"
+            ),
+            "video_storage_backend": "vercel_blob",
+        }
+        self.assertEqual(
+            self.helpers["response_video_playback"]("match123", response),
+            (
+                "/interviews/by-match/match123/responses/0/video",
+                "available",
+            ),
+        )
+
+    def test_byte_ranges_support_standard_open_and_suffix_forms(self):
+        parse = self.helpers["parse_byte_range"]
+        self.assertEqual(parse("bytes=10-19", 100), (10, 19))
+        self.assertEqual(parse("bytes=90-", 100), (90, 99))
+        self.assertEqual(parse("bytes=-10", 100), (90, 99))
+        self.assertIsNone(parse(None, 100))
 
     def test_existing_legacy_file_is_supported_only_inside_media_root(self):
         video_path = (

@@ -29,13 +29,13 @@ from pathlib import Path, PurePosixPath
 import secrets
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import AsyncIterator, Optional
 from urllib.parse import quote
 from bson import ObjectId
 
 import numpy as np
 from PIL import Image
-from fastapi import Depends, FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import Depends, FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -62,7 +62,10 @@ from db import (
 from auth import get_current_recruiter, router as auth_router
 from email_service import send_email
 from profile_pdf import generate_profile_pdf
-from object_storage import ObjectStorage
+from object_storage import (
+    VERCEL_BLOB_STORAGE_BACKEND,
+    ObjectStorage,
+)
 from recording_observations import (
     OBSERVATION_SCHEMA_VERSION,
     analyze_recording,
@@ -91,6 +94,11 @@ if not _configured_interview_media_root.is_absolute():
     _configured_interview_media_root = BACKEND_DIR / _configured_interview_media_root
 INTERVIEW_MEDIA_ROOT = _configured_interview_media_root.resolve()
 INTERVIEW_VIDEO_KEY_PREFIX = PurePosixPath("media/interviews")
+INTERVIEW_VIDEO_STORAGE = ObjectStorage(
+    local_root=INTERVIEW_MEDIA_ROOT,
+    key_prefix=INTERVIEW_VIDEO_KEY_PREFIX,
+)
+MAX_INTERVIEW_VIDEO_BYTES = 100 * 1024 * 1024
 
 _configured_profile_media_root = Path(
     os.getenv("PROFILE_MEDIA_ROOT", str(BACKEND_DIR / "media" / "profiles"))
@@ -154,7 +162,7 @@ def resolve_interview_video_storage_key(storage_key: str) -> Optional[Path]:
     interview_id, filename = key_path.parts[-2:]
     if not re.fullmatch(r"[a-fA-F0-9]+", interview_id):
         return None
-    if not re.fullmatch(r"\d+\.webm", filename):
+    if not re.fullmatch(r"\d+(?:-[A-Za-z0-9_-]+)?\.webm", filename):
         return None
 
     try:
@@ -167,6 +175,29 @@ def resolve_interview_video_storage_key(storage_key: str) -> Optional[Path]:
         return None
 
     return video_path
+
+
+def validate_uploaded_interview_video_key(
+    storage_key: str,
+    interview_id,
+    question_index: int,
+) -> bool:
+    """Accept only a Blob-generated variant of the current response pathname."""
+    if not isinstance(storage_key, str):
+        return False
+    expected = PurePosixPath(interview_video_storage_key(interview_id, question_index))
+    try:
+        actual = PurePosixPath(storage_key)
+    except (TypeError, ValueError):
+        return False
+    if actual.parent != expected.parent:
+        return False
+    return bool(
+        re.fullmatch(
+            rf"{question_index}(?:-[A-Za-z0-9_-]+)?\.webm",
+            actual.name,
+        )
+    )
 
 
 def resolve_stored_interview_video_path(response: dict) -> Optional[Path]:
@@ -293,6 +324,12 @@ def response_video_playback(
     """Return a controlled playback URL and an explicit playback state."""
     storage_key = response.get("video_storage_key")
     if storage_key:
+        if response.get("video_storage_backend") == VERCEL_BLOB_STORAGE_BACKEND:
+            question_index = response.get("question_index")
+            return (
+                f"/interviews/by-match/{match_id}/responses/{question_index}/video",
+                "available",
+            )
         video_path = resolve_stored_interview_video_path(response)
         if video_path and video_path.is_file():
             question_index = response.get("question_index")
@@ -314,6 +351,54 @@ def response_video_playback(
         return None, "historical_unavailable"
 
     return None, "not_recorded"
+
+
+def parse_byte_range(range_header: Optional[str], size: int) -> Optional[tuple[int, int]]:
+    """Parse one HTTP byte range, rejecting malformed or multi-range requests."""
+    if not range_header:
+        return None
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+    if not match or size <= 0:
+        raise HTTPException(416, "Invalid video byte range")
+    start_text, end_text = match.groups()
+    if not start_text and not end_text:
+        raise HTTPException(416, "Invalid video byte range")
+    if start_text:
+        start = int(start_text)
+        end = int(end_text) if end_text else size - 1
+    else:
+        suffix_length = int(end_text)
+        if suffix_length <= 0:
+            raise HTTPException(416, "Invalid video byte range")
+        start = max(0, size - suffix_length)
+        end = size - 1
+    if start >= size or end < start:
+        raise HTTPException(416, "Requested video range is not available")
+    return start, min(end, size - 1)
+
+
+async def iter_stream_range(
+    stream: AsyncIterator[bytes],
+    start: int,
+    end: int,
+) -> AsyncIterator[bytes]:
+    """Slice an authenticated private-Blob stream for HTML video range playback."""
+    offset = 0
+    try:
+        async for chunk in stream:
+            chunk_end = offset + len(chunk) - 1
+            if chunk_end >= start and offset <= end:
+                left = max(0, start - offset)
+                right = min(len(chunk), end - offset + 1)
+                if left < right:
+                    yield chunk[left:right]
+            offset += len(chunk)
+            if offset > end:
+                break
+    finally:
+        close_stream = getattr(stream, "aclose", None)
+        if close_stream is not None:
+            await close_stream()
 
 
 class ServicePrefixMiddleware:
@@ -1585,7 +1670,11 @@ async def get_interview_by_match(match_id: str):
 
 
 @app.get("/interviews/by-match/{match_id}/responses/{question_index}/video", dependencies=[Depends(get_current_recruiter)])
-async def get_interview_response_video(match_id: str, question_index: int):
+async def get_interview_response_video(
+    match_id: str,
+    question_index: int,
+    request: Request,
+):
     """Controlled recruiter playback endpoint for persisted interview response video."""
     if not ObjectId.is_valid(match_id):
         raise HTTPException(404, "No interview found for this match")
@@ -1608,13 +1697,56 @@ async def get_interview_response_video(match_id: str, question_index: int):
     if not response:
         raise HTTPException(404, "Interview response not found")
 
-    video_path = resolve_stored_interview_video_path(response)
-    if not video_path or not video_path.exists() or not video_path.is_file():
-        raise HTTPException(404, "Stored video file not found")
-
     media_type = response.get("video_content_type") or "video/webm"
     if not media_type.startswith("video/"):
         media_type = "video/webm"
+
+    storage_key = response.get("video_storage_key")
+    storage_backend = response.get("video_storage_backend")
+    if storage_key and storage_backend == VERCEL_BLOB_STORAGE_BACKEND:
+        try:
+            download = await INTERVIEW_VIDEO_STORAGE.get(
+                storage_key,
+                backend=storage_backend,
+                default_content_type=media_type,
+            )
+        except (ValueError, RuntimeError):
+            download = None
+        if download is None or download.stream is None:
+            raise HTTPException(404, "Stored video file not found")
+
+        media_type = download.content_type if download.content_type.startswith("video/") else media_type
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "private, no-cache",
+            "X-Content-Type-Options": "nosniff",
+        }
+        if download.etag:
+            headers["ETag"] = download.etag
+        if download.size is not None:
+            try:
+                requested_range = parse_byte_range(request.headers.get("range"), download.size)
+            except HTTPException:
+                close_stream = getattr(download.stream, "aclose", None)
+                if close_stream is not None:
+                    await close_stream()
+                raise
+            if requested_range is not None:
+                start, end = requested_range
+                headers["Content-Range"] = f"bytes {start}-{end}/{download.size}"
+                headers["Content-Length"] = str(end - start + 1)
+                return StreamingResponse(
+                    iter_stream_range(download.stream, start, end),
+                    status_code=206,
+                    media_type=media_type,
+                    headers=headers,
+                )
+            headers["Content-Length"] = str(download.size)
+        return StreamingResponse(download.stream, media_type=media_type, headers=headers)
+
+    video_path = resolve_stored_interview_video_path(response)
+    if not video_path or not video_path.exists() or not video_path.is_file():
+        raise HTTPException(404, "Stored video file not found")
 
     return FileResponse(
         path=str(video_path),
@@ -1752,13 +1884,13 @@ async def submit_response(token: str, audio: UploadFile = File(...)):
     }
 
 
-@app.post("/interviews/{token}/respond-video")
-async def submit_video_response(token: str, video: UploadFile = File(...)):
-    """
-    Candidate submits video for one question.
-    Extracts audio track for Whisper transcription.
-    Stores video reference for later frame analysis.
-    """
+class InterviewVideoReference(BaseModel):
+    video_storage_key: str
+    video_size_bytes: int
+    video_content_type: str = "video/webm"
+
+
+async def get_open_interview_for_video(token: str) -> tuple[dict, int]:
     interview = await interviews_collection.find_one({"token": token})
     if not interview:
         raise HTTPException(404, "Interview not found")
@@ -1772,90 +1904,211 @@ async def submit_video_response(token: str, video: UploadFile = File(...)):
     question_index = len(interview.get("responses", []))
     if question_index >= len(interview["questions"]):
         raise HTTPException(400, "All questions already answered")
+    return interview, question_index
 
-    # Save video to a temp file for Whisper/OpenCV, then persist a controlled copy
-    suffix = ".webm"
-    video_bytes = await video.read()
-    video_size_bytes = len(video_bytes)
-    video_storage_key = interview_video_storage_key(interview["_id"], question_index)
-    persisted_video_path = resolve_interview_video_storage_key(video_storage_key)
-    if not persisted_video_path:
-        raise HTTPException(500, "Could not resolve interview video storage")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(video_bytes)
-        tmp_path = tmp.name
+def video_submission_result(interview: dict) -> dict:
+    response_count = len(interview.get("responses", []))
+    if response_count >= len(interview["questions"]):
+        return {
+            "completed": True,
+            "message": "All questions answered. Thank you!",
+            "next_question": None,
+            "next_question_index": None,
+        }
+    return {
+        "completed": False,
+        "next_question_index": response_count,
+        "next_question": interview["questions"][response_count],
+    }
 
-    try:
-        # Transcribe audio from the video file using Whisper
-        with open(tmp_path, "rb") as f:
-            transcription = client.audio.transcriptions.create(
-                model="whisper-1", file=f,
-            )
-        transcript = transcription.text
 
-        # Extract multiple key frames from the video for later vision analysis
-        # We store base64 encoded frame snapshots per response
-        frames_b64 = extract_video_frames(tmp_path, num_frames=6)
-        video_duration_seconds = get_video_duration_seconds(tmp_path)
-
-        persisted_video_path.parent.mkdir(parents=True, exist_ok=True)
-        persisted_video_path.write_bytes(video_bytes)
-    finally:
-        os.remove(tmp_path)
+async def process_stored_video_response(
+    *,
+    token: str,
+    interview: dict,
+    question_index: int,
+    video_path: Path,
+    video_storage_key: str,
+    video_storage_backend: str,
+    video_size_bytes: int,
+    video_content_type: str,
+) -> dict:
+    now = datetime.now(timezone.utc)
+    with video_path.open("rb") as video_file:
+        transcription = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=video_file,
+        )
+    transcript = transcription.text
+    frames_b64 = extract_video_frames(str(video_path), num_frames=6)
+    video_duration_seconds = get_video_duration_seconds(str(video_path))
 
     video_url = f"/interviews/by-match/{str(interview['match_id'])}/responses/{question_index}/video"
-    video_content_type = video.content_type or "video/webm"
-    print(
-        "[video] response saved "
-        f"interview_id={interview['_id']} q={question_index} "
-        f"storage_key={video_storage_key} bytes={video_size_bytes} "
-        f"duration_seconds={video_duration_seconds} frames={len(frames_b64)} "
-        f"status={'pending' if frames_b64 else 'failed'}"
-    )
-
     response_doc = {
         "question_index": question_index,
         "question": interview["questions"][question_index],
         "transcript": transcript,
         "video_storage_key": video_storage_key,
+        "video_storage_backend": video_storage_backend,
         "video_url": video_url,
         "video_size_bytes": video_size_bytes,
         "video_duration_seconds": video_duration_seconds,
         "video_content_type": video_content_type,
-        "frames_b64": frames_b64,   # list of base64 frames, not single frame
+        "frames_b64": frames_b64,
         "submitted_at": now.isoformat(),
     }
 
     new_responses = interview.get("responses", []) + [response_doc]
     all_done = len(new_responses) >= len(interview["questions"])
-
-    next_video_analysis_status = "pending" if any(r.get("frames_b64") for r in new_responses) else "failed"
-
-    await interviews_collection.update_one(
-        {"token": token},
+    next_video_analysis_status = (
+        "pending" if any(response.get("frames_b64") for response in new_responses) else "failed"
+    )
+    update_result = await interviews_collection.update_one(
+        {"token": token, "responses": interview.get("responses", [])},
         {"$set": {
             "responses": new_responses,
             "status": "Completed" if all_done else "Started",
             "video_analysis_status": next_video_analysis_status,
-        }}
+        }},
+    )
+    if getattr(update_result, "modified_count", 1) == 0:
+        current = await interviews_collection.find_one({"token": token})
+        if current and any(
+            response.get("video_storage_key") == video_storage_key
+            for response in current.get("responses", [])
+        ):
+            return video_submission_result(current)
+        raise HTTPException(409, "Interview response changed; please retry submission")
+
+    updated_interview = {**interview, "responses": new_responses}
+    print(
+        "[video] response saved "
+        f"interview_id={interview['_id']} q={question_index} "
+        f"storage_backend={video_storage_backend} storage_key={video_storage_key} "
+        f"bytes={video_size_bytes} duration_seconds={video_duration_seconds} "
+        f"frames={len(frames_b64)} status={'pending' if frames_b64 else 'failed'}"
     )
 
-    if all_done:
-        interview_doc = await interviews_collection.find_one({"token": token})
-        if interview_doc and interview_doc.get("match_id"):
-            await matches_collection.update_one(
-                {"_id": interview_doc["match_id"]},
-                {"$set": {"status": "Interview Completed", "updated_at": now}}
-            )
-        return {"completed": True, "message": "All questions answered. Thank you!",
-                "next_question": None, "next_question_index": None}
+    if all_done and interview.get("match_id"):
+        await matches_collection.update_one(
+            {"_id": interview["match_id"]},
+            {"$set": {"status": "Interview Completed", "updated_at": now}},
+        )
+    return video_submission_result(updated_interview)
 
+
+@app.post("/interviews/{token}/video-upload-intent")
+async def create_interview_video_upload_intent(token: str):
+    """Authorize one tightly scoped upload for the candidate's current question."""
+    interview, question_index = await get_open_interview_for_video(token)
     return {
-        "completed": False,
-        "next_question_index": question_index + 1,
-        "next_question": interview["questions"][question_index + 1],
+        "upload_mode": (
+            "direct_blob"
+            if INTERVIEW_VIDEO_STORAGE.backend == VERCEL_BLOB_STORAGE_BACKEND
+            else "multipart"
+        ),
+        "question_index": question_index,
+        "pathname": interview_video_storage_key(interview["_id"], question_index),
+        "maximum_size_bytes": MAX_INTERVIEW_VIDEO_BYTES,
     }
+
+
+@app.post("/interviews/{token}/respond-video-reference")
+async def submit_video_response_reference(token: str, payload: InterviewVideoReference):
+    """Process a private Blob reference without accepting the WebM request body."""
+    interview = await interviews_collection.find_one({"token": token})
+    if not interview:
+        raise HTTPException(404, "Interview not found")
+    existing_response = next(
+        (
+            response for response in interview.get("responses", [])
+            if response.get("video_storage_key") == payload.video_storage_key
+        ),
+        None,
+    )
+    if existing_response:
+        return video_submission_result(interview)
+
+    interview, question_index = await get_open_interview_for_video(token)
+    if INTERVIEW_VIDEO_STORAGE.backend != VERCEL_BLOB_STORAGE_BACKEND:
+        raise HTTPException(400, "Direct Blob submission is not enabled")
+    if not validate_uploaded_interview_video_key(
+        payload.video_storage_key,
+        interview["_id"],
+        question_index,
+    ):
+        raise HTTPException(400, "Invalid interview video storage key")
+    if payload.video_size_bytes <= 0 or payload.video_size_bytes > MAX_INTERVIEW_VIDEO_BYTES:
+        raise HTTPException(413, "Interview video exceeds the allowed size")
+    if payload.video_content_type.split(";", 1)[0].strip().lower() != "video/webm":
+        raise HTTPException(415, "Interview video must be WebM")
+
+    materialized = await INTERVIEW_VIDEO_STORAGE.materialize(
+        payload.video_storage_key,
+        backend=VERCEL_BLOB_STORAGE_BACKEND,
+        suffix=".webm",
+        default_content_type="video/webm",
+    )
+    if materialized is None:
+        raise HTTPException(409, "Uploaded interview video was not found")
+    try:
+        stored_size = materialized.download.size or materialized.path.stat().st_size
+        if stored_size != payload.video_size_bytes:
+            raise HTTPException(400, "Uploaded interview video size mismatch")
+        stored_content_type = materialized.download.content_type or "video/webm"
+        if stored_content_type.split(";", 1)[0].strip().lower() != "video/webm":
+            raise HTTPException(415, "Stored interview video must be WebM")
+        return await process_stored_video_response(
+            token=token,
+            interview=interview,
+            question_index=question_index,
+            video_path=materialized.path,
+            video_storage_key=payload.video_storage_key,
+            video_storage_backend=VERCEL_BLOB_STORAGE_BACKEND,
+            video_size_bytes=stored_size,
+            video_content_type="video/webm",
+        )
+    finally:
+        if materialized.temporary:
+            materialized.path.unlink(missing_ok=True)
+
+
+@app.post("/interviews/{token}/respond-video")
+async def submit_video_response(token: str, video: UploadFile = File(...)):
+    """Local-development-compatible multipart video submission."""
+    interview, question_index = await get_open_interview_for_video(token)
+
+    video_bytes = await video.read()
+    video_size_bytes = len(video_bytes)
+    if video_size_bytes <= 0 or video_size_bytes > MAX_INTERVIEW_VIDEO_BYTES:
+        raise HTTPException(413, "Interview video exceeds the allowed size")
+    video_content_type = video.content_type or "video/webm"
+    if video_content_type.split(";", 1)[0].strip().lower() != "video/webm":
+        raise HTTPException(415, "Interview video must be WebM")
+    video_storage_key = interview_video_storage_key(interview["_id"], question_index)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+        tmp.write(video_bytes)
+        tmp_path = Path(tmp.name)
+
+    try:
+        stored = await INTERVIEW_VIDEO_STORAGE.put_bytes(
+            video_storage_key,
+            video_bytes,
+            content_type="video/webm",
+        )
+        return await process_stored_video_response(
+            token=token,
+            interview=interview,
+            question_index=question_index,
+            video_path=tmp_path,
+            video_storage_key=stored.key,
+            video_storage_backend=stored.backend,
+            video_size_bytes=video_size_bytes,
+            video_content_type="video/webm",
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def extract_video_frames(video_path: str, num_frames: int = 6) -> list[str]:
@@ -2341,11 +2594,17 @@ async def assess_interview_with_video(token: str):
             "cv_consistency": interview.get("cv_consistency"),
         }
 
-    responses = backfill_missing_video_frames(interview.get("responses", []))
+    responses = [dict(response) for response in interview.get("responses", [])]
     stored_has_frames = any(response.get("frames_b64") for response in responses)
+    has_recoverable_blob_without_frames = any(
+        response.get("video_storage_key")
+        and response.get("video_storage_backend") == VERCEL_BLOB_STORAGE_BACKEND
+        and not response.get("frames_b64")
+        for response in responses
+    )
     stale_failed_or_unavailable_with_frames = (
         interview.get("video_analysis_status") in ("failed", "unavailable")
-        and stored_has_frames
+        and (stored_has_frames or has_recoverable_blob_without_frames)
     )
     stale_observation_schema = (
         (interview.get("video_analysis") or {}).get("observation_schema_version")
@@ -2388,8 +2647,30 @@ async def assess_interview_with_video(token: str):
     }
     for response in responses:
         question_index = response.get("question_index")
-        recording_path = resolve_stored_interview_video_path(response)
+        materialized_recording = None
+        recording_path = None
         observation_started = datetime.now(timezone.utc)
+        try:
+            if (
+                response.get("video_storage_key")
+                and response.get("video_storage_backend") == VERCEL_BLOB_STORAGE_BACKEND
+            ):
+                materialized_recording = await INTERVIEW_VIDEO_STORAGE.materialize(
+                    response["video_storage_key"],
+                    backend=VERCEL_BLOB_STORAGE_BACKEND,
+                    suffix=".webm",
+                    default_content_type="video/webm",
+                )
+                recording_path = materialized_recording.path if materialized_recording else None
+            else:
+                recording_path = resolve_stored_interview_video_path(response)
+        except Exception as storage_error:
+            print(
+                "[recording observations] storage fetch failed "
+                f"interview_id={interview['_id']} q={question_index} "
+                f"error_type={type(storage_error).__name__}"
+            )
+
         if not recording_path or not recording_path.is_file():
             recording_observations = unavailable_recording_observations(
                 "no_recording",
@@ -2397,6 +2678,11 @@ async def assess_interview_with_video(token: str):
             )
         else:
             try:
+                if not response.get("frames_b64"):
+                    response["frames_b64"] = extract_video_frames(
+                        str(recording_path),
+                        num_frames=6,
+                    )
                 recording_observations = analyze_recording(str(recording_path))
             except Exception as observation_error:
                 print(
@@ -2408,6 +2694,9 @@ async def assess_interview_with_video(token: str):
                     "failed",
                     "Optional presentation and speaker analysis failed; transcript, score, and playback remain available.",
                 )
+            finally:
+                if materialized_recording and materialized_recording.temporary:
+                    materialized_recording.path.unlink(missing_ok=True)
         observation_timing = recording_observations.pop("_timing", {})
         for timing_name in observation_timing_totals:
             observation_timing_totals[timing_name] += float(

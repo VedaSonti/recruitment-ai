@@ -50,6 +50,13 @@ class StoredObjectDownload:
     size: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class MaterializedStoredObject:
+    download: StoredObjectDownload
+    path: Path
+    temporary: bool
+
+
 class ObjectStorage:
     """Store one controlled key namespace in local files or private Vercel Blob."""
 
@@ -229,3 +236,48 @@ class ObjectStorage:
             etag=result.blob.etag,
             size=result.blob.size,
         )
+
+    async def materialize(
+        self,
+        key: str,
+        *,
+        backend: Optional[str] = None,
+        suffix: str = "",
+        default_content_type: str = "application/octet-stream",
+    ) -> Optional[MaterializedStoredObject]:
+        """Return a local path for processing without assuming durable storage is local."""
+        download = await self.get(
+            key,
+            backend=backend,
+            default_content_type=default_content_type,
+        )
+        if download is None:
+            return None
+        if download.local_path is not None:
+            return MaterializedStoredObject(
+                download=download,
+                path=download.local_path,
+                temporary=False,
+            )
+        if download.stream is None:
+            return None
+
+        temporary_path: Optional[Path] = None
+        bytes_written = 0
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary:
+                temporary_path = Path(temporary.name)
+                async for chunk in download.stream:
+                    temporary.write(chunk)
+                    bytes_written += len(chunk)
+            if download.size is not None and bytes_written != download.size:
+                raise IOError("Stored object download size did not match its metadata")
+            return MaterializedStoredObject(
+                download=download,
+                path=temporary_path,
+                temporary=True,
+            )
+        except Exception:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise

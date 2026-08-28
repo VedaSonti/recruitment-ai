@@ -10,6 +10,7 @@ import {
   type RefCallback,
 } from "react";
 import { useParams } from "next/navigation";
+import { upload } from "@vercel/blob/client";
 import {
   AlertCircle,
   Camera,
@@ -64,6 +65,13 @@ interface RespondResult {
   completed?: boolean;
   next_question_index?: number;
   next_question?: string | null;
+}
+
+interface VideoUploadIntent {
+  upload_mode: "direct_blob" | "multipart";
+  question_index: number;
+  pathname: string;
+  maximum_size_bytes: number;
 }
 
 function isStreamUsable(stream: MediaStream | null) {
@@ -533,58 +541,95 @@ export default function InterviewPage() {
       }
 
       setPhase("processing");
+      try {
+        const intentResponse = await fetch(
+          `${BASE_URL}/interviews/${encodeURIComponent(token)}/video-upload-intent`,
+          { method: "POST" },
+        );
+        if (!intentResponse.ok) {
+          throw new Error(`Upload intent status ${intentResponse.status}`);
+        }
+        const intent = (await intentResponse.json()) as VideoUploadIntent;
+        if (blob.size <= 0 || blob.size > intent.maximum_size_bytes) {
+          throw new Error("Recorded video exceeds the allowed upload size");
+        }
 
-      for (let attempt = 1; attempt <= 3; attempt += 1) {
-        const formData = new FormData();
-        formData.append("video", blob, "answer.webm");
+        let responseEndpoint = `${BASE_URL}/interviews/${encodeURIComponent(token)}/respond-video`;
+        let videoReference: Record<string, string | number> | null = null;
+        if (intent.upload_mode === "direct_blob") {
+          const webmBlob = new Blob([blob], { type: "video/webm" });
+          const storedVideo = await upload(intent.pathname, webmBlob, {
+            access: "private",
+            handleUploadUrl: "/api/interview-video-upload",
+            clientPayload: JSON.stringify({
+              interviewToken: token,
+              questionIndex: intent.question_index,
+            }),
+          });
+          videoReference = {
+            video_storage_key: storedVideo.pathname,
+            video_size_bytes: webmBlob.size,
+            video_content_type: "video/webm",
+          };
+          responseEndpoint = `${BASE_URL}/interviews/${encodeURIComponent(token)}/respond-video-reference`;
+        }
 
-        try {
-          const response = await fetch(
-            `${BASE_URL}/interviews/${encodeURIComponent(token)}/respond-video`,
-            {
-              method: "POST",
-              body: formData,
-            },
-          );
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          const requestOptions: RequestInit = videoReference
+            ? {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(videoReference),
+              }
+            : (() => {
+                const formData = new FormData();
+                formData.append("video", blob, "answer.webm");
+                return { method: "POST", body: formData };
+              })();
+          try {
+            const response = await fetch(responseEndpoint, requestOptions);
+            if (!response.ok) {
+              throw new Error(`Status ${response.status}`);
+            }
 
-          if (!response.ok) {
-            throw new Error(`Status ${response.status}`);
-          }
+            const data = (await response.json()) as RespondResult;
+            if (data.completed) {
+              fetch(`${BASE_URL}/interviews/${encodeURIComponent(token)}/assess-video`, {
+                method: "POST",
+              }).catch(() => undefined);
+              stopStream("interview completed");
+              setPhase("complete");
+              return;
+            }
 
-          const data = (await response.json()) as RespondResult;
-
-          if (data.completed) {
-            fetch(`${BASE_URL}/interviews/${encodeURIComponent(token)}/assess-video`, {
-              method: "POST",
-            }).catch(() => undefined);
-            stopStream("interview completed");
-            setPhase("complete");
+            const nextIndex = data.next_question_index ?? currentIndex + 1;
+            setCurrentIndex(nextIndex);
+            setInterview((previous) =>
+              previous
+                ? {
+                    ...previous,
+                    current_question_index: nextIndex,
+                    current_question: data.next_question ?? previous.current_question,
+                    questions_answered: nextIndex,
+                  }
+                : previous,
+            );
+            window.setTimeout(() => {
+              playQuestionRef.current(nextIndex);
+            }, 1500);
             return;
-          }
-
-          const nextIndex = data.next_question_index ?? currentIndex + 1;
-          setCurrentIndex(nextIndex);
-          setInterview((previous) =>
-            previous
-              ? {
-                  ...previous,
-                  current_question_index: nextIndex,
-                  current_question: data.next_question ?? previous.current_question,
-                  questions_answered: nextIndex,
-                }
-              : previous,
-          );
-
-          window.setTimeout(() => {
-            playQuestionRef.current(nextIndex);
-          }, 1500);
-          return;
-        } catch {
-          if (attempt === 3) {
-            setError("Failed to submit your video answer. Please check your connection and try again.");
-            setPhase("error");
+          } catch {
+            if (attempt === 3) {
+              throw new Error("Video processing request failed");
+            }
           }
         }
+      } catch (submissionError) {
+        console.error("[interview-video] Submission failed", {
+          errorType: submissionError instanceof Error ? submissionError.name : "UnknownError",
+        });
+        setError("Failed to submit your video answer. Please check your connection and try again.");
+        setPhase("error");
       }
     },
     [currentIndex, stopStream, token],
