@@ -282,9 +282,11 @@ class VideoObservationSafetyTests(unittest.TestCase):
             result["video_observations"]["neutral_summary"],
         )
 
-    def test_refresh_repeatedly_is_guarded_by_processing_status(self):
+    def test_refresh_repeatedly_uses_atomic_processing_claim(self):
         source = Path(__file__).with_name("main.py").read_text(encoding="utf-8")
-        self.assertIn('interview.get("video_analysis_status") == "processing"', source)
+        self.assertIn("find_one_and_update", source)
+        self.assertIn('"video_analysis_claim_id": claim_id', source)
+        self.assertIn('"video_analysis_heartbeat_at": {"$lt": stale_before}', source)
 
     def test_completed_assessment_is_not_regenerated(self):
         source = Path(__file__).with_name("main.py").read_text(encoding="utf-8")

@@ -39,6 +39,7 @@ from fastapi import Depends, FastAPI, UploadFile, File, HTTPException, Form, Req
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -2227,6 +2228,7 @@ def backfill_missing_video_frames(
 VIDEO_QUALITY_VALUES = {"good", "acceptable", "poor", "unknown"}
 VIDEO_NOISE_VALUES = {"low", "moderate", "high", "unknown"}
 VIDEO_ANALYSIS_STATUSES = {"pending", "processing", "completed", "failed", "unavailable"}
+VIDEO_ANALYSIS_STALE_AFTER = timedelta(minutes=15)
 FILLER_WORDS = {"um", "uh", "erm", "ah", "like"}
 FILLER_PHRASES = ["you know", "sort of", "kind of"]
 PROHIBITED_VIDEO_OBSERVATION_TERMS = [
@@ -2573,6 +2575,126 @@ def merge_recording_observations(
     return merged
 
 
+def generate_interview_answer_assessment(interview: dict, job: Optional[dict], qa_text: str) -> dict:
+    quality_prompt = f"""You are an experienced recruitment interviewer reviewing a candidate's responses.
+
+Job: {interview['job_title']}
+Required skills: {', '.join((job or {}).get('required_skills', []))}
+Candidate: {interview['candidate_name']}
+Interview format: 30 seconds per answer.
+
+Interview transcript:
+{qa_text}
+
+Assess answer relevance and evidence objectively. Do not make a hiring decision. Do not infer personality, emotions, honesty, protected characteristics, or cultural fit. Present job-relevant facts only.
+
+Return ONLY valid JSON:
+{{
+  "overall_interview_score": <0-100>,
+  "summary": "2-3 sentence factual summary of the answers",
+  "answer_assessments": [
+    {{"question_index": 0, "question": "...", "score": <0-100>, "comment": "one sentence factual answer feedback"}}
+  ],
+  "key_observations": ["job-relevant observation 1", "job-relevant observation 2"],
+  "areas_to_probe": ["follow-up area 1", "follow-up area 2"]
+}}"""
+
+    quality_response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": quality_prompt}],
+        temperature=0.3,
+    )
+    return json.loads(strip_json_fences(quality_response.choices[0].message.content))
+
+
+def video_assessment_response(interview: dict, message: str) -> dict:
+    return {
+        "message": message,
+        "assessment": interview.get("assessment"),
+        "video_analysis": interview.get("video_analysis"),
+        "video_analysis_status": interview.get("video_analysis_status", "pending"),
+        "cv_consistency": interview.get("cv_consistency"),
+    }
+
+
+async def claim_video_assessment(interview: dict, *, now: datetime, claim_id: str) -> Optional[dict]:
+    """Atomically claim new work or recover a stale/dead assessment invocation."""
+    stale_before = now - VIDEO_ANALYSIS_STALE_AFTER
+    return await interviews_collection.find_one_and_update(
+        {
+            "_id": interview["_id"],
+            "status": {"$in": ["Completed", "Assessed"]},
+            "$or": [
+                {"video_analysis_status": {"$ne": "processing"}},
+                {"video_analysis_heartbeat_at": {"$lt": stale_before}},
+                {
+                    "video_analysis_heartbeat_at": {"$exists": False},
+                    "video_analysis_started_at": {"$exists": False},
+                },
+                {
+                    "video_analysis_heartbeat_at": {"$exists": False},
+                    "video_analysis_started_at": None,
+                },
+                {
+                    "video_analysis_heartbeat_at": {"$exists": False},
+                    "video_analysis_started_at": {"$lt": stale_before},
+                },
+            ],
+        },
+        {
+            "$set": {
+                "video_analysis_status": "processing",
+                "video_analysis_started_at": now,
+                "video_analysis_heartbeat_at": now,
+                "video_analysis_claim_id": claim_id,
+                "video_analysis_stage": "claimed",
+            },
+            "$unset": {
+                "video_analysis_finished_at": "",
+                "video_analysis_last_error": "",
+            },
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+async def fail_video_assessment_claim(
+    *,
+    token: str,
+    claim_id: str,
+    responses: list[dict],
+    error: Exception,
+) -> None:
+    """Release a live claim without erasing transcript or completed assessment data."""
+    current = await interviews_collection.find_one({"token": token})
+    failed_analysis = (current or {}).get("video_analysis")
+    if not failed_analysis:
+        failed_analysis = build_unavailable_video_analysis(
+            "Assessment processing stopped before video observations could be completed.",
+            responses,
+            status="failed",
+            video_available=any(response_has_video(response) for response in responses),
+        )
+    await interviews_collection.update_one(
+        {
+            "token": token,
+            "video_analysis_status": "processing",
+            "video_analysis_claim_id": claim_id,
+        },
+        {
+            "$set": {
+                "video_analysis_status": "failed",
+                "video_analysis": failed_analysis,
+                "video_analysis_finished_at": datetime.now(timezone.utc),
+                "video_analysis_heartbeat_at": datetime.now(timezone.utc),
+                "video_analysis_stage": "failed",
+                "video_analysis_last_error": type(error).__name__,
+            },
+            "$unset": {"video_analysis_claim_id": ""},
+        },
+    )
+
+
 @app.post("/interviews/{token}/assess-video")
 async def assess_interview_with_video(token: str):
     """
@@ -2584,15 +2706,6 @@ async def assess_interview_with_video(token: str):
         raise HTTPException(404, "Interview not found")
     if interview["status"] not in ("Completed", "Assessed"):
         raise HTTPException(400, "Interview not yet completed")
-
-    if interview.get("video_analysis_status") == "processing":
-        return {
-            "message": "Video observations are still processing",
-            "assessment": interview.get("assessment"),
-            "video_analysis": interview.get("video_analysis"),
-            "video_analysis_status": "processing",
-            "cv_consistency": interview.get("cv_consistency"),
-        }
 
     responses = [dict(response) for response in interview.get("responses", [])]
     stored_has_frames = any(response.get("frames_b64") for response in responses)
@@ -2617,18 +2730,38 @@ async def assess_interview_with_video(token: str):
         and not stale_failed_or_unavailable_with_frames
         and not stale_observation_schema
     ):
-        return {
-            "message": "Already assessed",
-            "assessment": interview.get("assessment"),
-            "video_analysis": interview.get("video_analysis"),
-            "video_analysis_status": interview.get("video_analysis_status"),
-            "cv_consistency": interview.get("cv_consistency"),
-        }
+        return video_assessment_response(interview, "Already assessed")
 
-    await interviews_collection.update_one(
-        {"token": token},
-        {"$set": {"video_analysis_status": "processing"}}
+    claim_id = secrets.token_urlsafe(18)
+    claimed = await claim_video_assessment(
+        interview,
+        now=datetime.now(timezone.utc),
+        claim_id=claim_id,
     )
+    if not claimed:
+        current = await interviews_collection.find_one({"token": token}) or interview
+        return video_assessment_response(current, "Video observations are still processing")
+
+    try:
+        return await run_claimed_video_assessment(token, claimed, claim_id)
+    except Exception as assessment_error:
+        print(
+            "[video assessment] failed "
+            f"interview_id={interview['_id']} stage=unhandled "
+            f"error_type={type(assessment_error).__name__}"
+        )
+        await fail_video_assessment_claim(
+            token=token,
+            claim_id=claim_id,
+            responses=[dict(response) for response in claimed.get("responses", [])],
+            error=assessment_error,
+        )
+        raise HTTPException(500, "Interview assessment could not be completed; it can be retried.") from assessment_error
+
+
+async def run_claimed_video_assessment(token: str, interview: dict, claim_id: str) -> dict:
+    pipeline_started = time.monotonic()
+    responses = [dict(response) for response in interview.get("responses", [])]
 
     job = await jobs_collection.find_one({"_id": interview["job_id"]})
     candidate = await candidates_collection.find_one({"_id": interview["candidate_id"]})
@@ -2637,7 +2770,42 @@ async def assess_interview_with_video(token: str):
         for i, r in enumerate(responses)
     ])
 
-    recording_observations_by_question = {}
+    pipeline_timing = {
+        "blob_materialization_seconds": 0.0,
+        "answer_assessment_seconds": 0.0,
+        "visual_assessment_seconds": 0.0,
+        "cv_consistency_seconds": 0.0,
+        "persistence_seconds": 0.0,
+    }
+    assessment = interview.get("assessment")
+    if not assessment:
+        answer_started = time.monotonic()
+        assessment = generate_interview_answer_assessment(interview, job, qa_text)
+        pipeline_timing["answer_assessment_seconds"] = time.monotonic() - answer_started
+        persistence_started = time.monotonic()
+        await interviews_collection.update_one(
+            {
+                "token": token,
+                "video_analysis_status": "processing",
+                "video_analysis_claim_id": claim_id,
+            },
+            {
+                "$set": {
+                    "assessment": assessment,
+                    "video_analysis_heartbeat_at": datetime.now(timezone.utc),
+                    "video_analysis_stage": "answer_assessment_completed",
+                }
+            },
+        )
+        pipeline_timing["persistence_seconds"] += time.monotonic() - persistence_started
+
+    progress = interview.get("video_analysis_progress") or {}
+    raw_recording_progress = progress.get("recording_observations_by_question") or {}
+    recording_observations_by_question = {
+        int(question_index): observation
+        for question_index, observation in raw_recording_progress.items()
+        if str(question_index).isdigit() and isinstance(observation, dict)
+    }
     observation_timing_totals = {
         "ffmpeg_seconds": 0.0,
         "head_analysis_seconds": 0.0,
@@ -2647,6 +2815,12 @@ async def assess_interview_with_video(token: str):
     }
     for response in responses:
         question_index = response.get("question_index")
+        if question_index in recording_observations_by_question:
+            print(
+                "[recording observations] resumed checkpoint "
+                f"interview_id={interview['_id']} q={question_index}"
+            )
+            continue
         materialized_recording = None
         recording_path = None
         observation_started = datetime.now(timezone.utc)
@@ -2655,12 +2829,18 @@ async def assess_interview_with_video(token: str):
                 response.get("video_storage_key")
                 and response.get("video_storage_backend") == VERCEL_BLOB_STORAGE_BACKEND
             ):
-                materialized_recording = await INTERVIEW_VIDEO_STORAGE.materialize(
-                    response["video_storage_key"],
-                    backend=VERCEL_BLOB_STORAGE_BACKEND,
-                    suffix=".webm",
-                    default_content_type="video/webm",
-                )
+                materialization_started = time.monotonic()
+                try:
+                    materialized_recording = await INTERVIEW_VIDEO_STORAGE.materialize(
+                        response["video_storage_key"],
+                        backend=VERCEL_BLOB_STORAGE_BACKEND,
+                        suffix=".webm",
+                        default_content_type="video/webm",
+                    )
+                finally:
+                    pipeline_timing["blob_materialization_seconds"] += (
+                        time.monotonic() - materialization_started
+                    )
                 recording_path = materialized_recording.path if materialized_recording else None
             else:
                 recording_path = resolve_stored_interview_video_path(response)
@@ -2703,6 +2883,23 @@ async def assess_interview_with_video(token: str):
                 observation_timing.get(timing_name, 0.0) or 0.0
             )
         recording_observations_by_question[question_index] = recording_observations
+        persistence_started = time.monotonic()
+        await interviews_collection.update_one(
+            {
+                "token": token,
+                "video_analysis_status": "processing",
+                "video_analysis_claim_id": claim_id,
+            },
+            {
+                "$set": {
+                    f"video_analysis_progress.recording_observations_by_question.{question_index}": recording_observations,
+                    "responses": responses,
+                    "video_analysis_heartbeat_at": datetime.now(timezone.utc),
+                    "video_analysis_stage": f"recording_observation_{question_index}_completed",
+                }
+            },
+        )
+        pipeline_timing["persistence_seconds"] += time.monotonic() - persistence_started
         head = recording_observations.get("head_orientation") or {}
         speaker = recording_observations.get("speaker_observations") or {}
         elapsed = (datetime.now(timezone.utc) - observation_started).total_seconds()
@@ -2714,38 +2911,6 @@ async def assess_interview_with_video(token: str):
             f"head_status={head.get('status')} speaker_status={speaker.get('status')} "
             f"analysis_seconds={elapsed:.2f}"
         )
-
-    assessment = interview.get("assessment")
-    if not assessment:
-        quality_prompt = f"""You are an experienced recruitment interviewer reviewing a candidate's responses.
-
-Job: {interview['job_title']}
-Required skills: {', '.join((job or {}).get('required_skills', []))}
-Candidate: {interview['candidate_name']}
-Interview format: 30 seconds per answer.
-
-Interview transcript:
-{qa_text}
-
-Assess answer relevance and evidence objectively. Do not make a hiring decision. Do not infer personality, emotions, honesty, protected characteristics, or cultural fit. Present job-relevant facts only.
-
-Return ONLY valid JSON:
-{{
-  "overall_interview_score": <0-100>,
-  "summary": "2-3 sentence factual summary of the answers",
-  "answer_assessments": [
-    {{"question_index": 0, "question": "...", "score": <0-100>, "comment": "one sentence factual answer feedback"}}
-  ],
-  "key_observations": ["job-relevant observation 1", "job-relevant observation 2"],
-  "areas_to_probe": ["follow-up area 1", "follow-up area 2"]
-}}"""
-
-        quality_response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": quality_prompt}],
-            temperature=0.3,
-        )
-        assessment = json.loads(strip_json_fences(quality_response.choices[0].message.content))
 
     all_frame_items = []
     for response in responses:
@@ -2858,6 +3023,7 @@ Return ONLY valid JSON in this exact shape:
                 },
             })
 
+        visual_started = time.monotonic()
         try:
             vision_response = client.chat.completions.create(
                 model="gpt-4o",
@@ -2875,6 +3041,8 @@ Return ONLY valid JSON in this exact shape:
                 status="failed",
                 video_available=any_video_uploaded,
             )
+        finally:
+            pipeline_timing["visual_assessment_seconds"] = time.monotonic() - visual_started
 
     video_analysis = merge_recording_observations(
         video_analysis,
@@ -2896,8 +3064,27 @@ Return ONLY valid JSON in this exact shape:
 
     updated_responses = apply_video_observations_to_responses(responses, video_analysis)
 
+    persistence_started = time.monotonic()
+    await interviews_collection.update_one(
+        {
+            "token": token,
+            "video_analysis_status": "processing",
+            "video_analysis_claim_id": claim_id,
+        },
+        {
+            "$set": {
+                "responses": updated_responses,
+                "video_analysis": video_analysis,
+                "video_analysis_heartbeat_at": datetime.now(timezone.utc),
+                "video_analysis_stage": "video_observations_completed",
+            }
+        },
+    )
+    pipeline_timing["persistence_seconds"] += time.monotonic() - persistence_started
+
     cv_consistency = interview.get("cv_consistency")
     if not cv_consistency:
+        consistency_started = time.monotonic()
         cv_raw = candidate.get("cv_raw", "") if candidate else ""
         cand_skills = candidate.get("skills", []) if candidate else []
         cand_years = candidate.get("years_experience", 0) if candidate else 0
@@ -2956,11 +3143,17 @@ Return ONLY valid JSON:
         except Exception as e:
             print(f"[cv consistency] Failed: {e}")
             cv_consistency = {"error": "CV consistency check could not be completed"}
+        finally:
+            pipeline_timing["cv_consistency_seconds"] = time.monotonic() - consistency_started
 
     now = datetime.now(timezone.utc)
     persistence_started = time.monotonic()
-    await interviews_collection.update_one(
-        {"token": token},
+    final_update = await interviews_collection.update_one(
+        {
+            "token": token,
+            "video_analysis_status": "processing",
+            "video_analysis_claim_id": claim_id,
+        },
         {"$set": {
             "responses": updated_responses,
             "assessment": assessment,
@@ -2969,16 +3162,25 @@ Return ONLY valid JSON:
             "cv_consistency": cv_consistency,
             "status": "Assessed",
             "assessed_at": now.isoformat(),
+            "video_analysis_finished_at": now,
+            "video_analysis_heartbeat_at": now,
+            "video_analysis_stage": "completed",
+        }, "$unset": {
+            "video_analysis_claim_id": "",
+            "video_analysis_progress": "",
+            "video_analysis_last_error": "",
         }}
     )
+    if getattr(final_update, "modified_count", 1) == 0:
+        raise RuntimeError("Video assessment claim was lost before final persistence")
 
     await matches_collection.update_one(
         {"_id": interview["match_id"]},
         {"$set": {"status": "Interview Completed", "updated_at": now}}
     )
-    persistence_seconds = time.monotonic() - persistence_started
+    pipeline_timing["persistence_seconds"] += time.monotonic() - persistence_started
     observation_total_seconds = (
-        observation_timing_totals["analysis_total_seconds"] + persistence_seconds
+        time.monotonic() - pipeline_started
     )
     print(
         "[recording observations timing] "
@@ -2987,7 +3189,11 @@ Return ONLY valid JSON:
         f"head_analysis_seconds={observation_timing_totals['head_analysis_seconds']:.3f} "
         f"speaker_model_load_seconds={observation_timing_totals['speaker_model_load_seconds']:.3f} "
         f"speaker_inference_seconds={observation_timing_totals['speaker_inference_seconds']:.3f} "
-        f"persistence_seconds={persistence_seconds:.3f} "
+        f"blob_materialization_seconds={pipeline_timing['blob_materialization_seconds']:.3f} "
+        f"answer_assessment_seconds={pipeline_timing['answer_assessment_seconds']:.3f} "
+        f"visual_assessment_seconds={pipeline_timing['visual_assessment_seconds']:.3f} "
+        f"cv_consistency_seconds={pipeline_timing['cv_consistency_seconds']:.3f} "
+        f"persistence_seconds={pipeline_timing['persistence_seconds']:.3f} "
         f"total_seconds={observation_total_seconds:.3f}"
     )
 
@@ -2998,6 +3204,20 @@ Return ONLY valid JSON:
         "video_analysis_status": video_analysis.get("video_analysis_status", "completed"),
         "cv_consistency": cv_consistency,
     }
+
+
+@app.post(
+    "/interviews/by-match/{match_id}/assess-video",
+    dependencies=[Depends(get_current_recruiter)],
+)
+async def retry_interview_video_assessment_by_match(match_id: str):
+    """Let the recruiter results flow safely resume a pending or stale assessment."""
+    if not ObjectId.is_valid(match_id):
+        raise HTTPException(404, "No interview found for this match")
+    interview = await interviews_collection.find_one({"match_id": ObjectId(match_id)})
+    if not interview:
+        raise HTTPException(404, "No interview found for this match")
+    return await assess_interview_with_video(interview["token"])
 
 
 @app.post("/interviews/{token}/assess")

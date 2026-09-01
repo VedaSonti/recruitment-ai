@@ -533,6 +533,55 @@ class IsolationTests(unittest.TestCase):
         self.assertFalse(quality["multiple_faces_detected"])
         self.assertEqual(per_response["face_visible_percentage"], 75.0)
 
+    def test_timestamped_head_and_speaker_intervals_are_retained(self):
+        merge = load_merge_function()
+        response = {"question_index": 0, "question": "Q", "transcript": "Answer"}
+        analysis = {
+            "video_analysis_status": "completed",
+            "video_observations": {"recording_quality": {}},
+            "per_response_observations": [],
+        }
+        recording = unavailable_recording_observations("failed", "unused")
+        head_intervals = [
+            {"type": "sustained_downward_orientation", "start_seconds": 4.0, "end_seconds": 7.0},
+            {"type": "face_absent", "start_seconds": 12.0, "end_seconds": 15.0},
+        ]
+        yaw_events = [
+            {"movement_type": "yaw", "timestamp_seconds": 9.5, "magnitude_degrees": 34.0}
+        ]
+        additional_speaker_intervals = [
+            {"speaker_label": "SPEAKER_01", "start_seconds": 18.0, "end_seconds": 23.0}
+        ]
+        overlap_intervals = [
+            {"start_seconds": 20.0, "end_seconds": 22.0}
+        ]
+        recording["head_orientation"].update(
+            status="completed",
+            head_observation_intervals=head_intervals,
+            rapid_movement_events=yaw_events,
+        )
+        recording["speaker_observations"].update(
+            status="completed",
+            possible_additional_speaker=True,
+            possible_second_speaker_intervals=additional_speaker_intervals,
+            overlapping_speech_detected=True,
+            overlapping_speech_intervals=overlap_intervals,
+        )
+
+        result = merge(analysis, [response], {0: recording})
+        per_response = result["per_response_observations"][0]["video_observations"]
+
+        self.assertEqual(per_response["head_orientation"]["head_observation_intervals"], head_intervals)
+        self.assertEqual(per_response["head_orientation"]["rapid_movement_events"], yaw_events)
+        self.assertEqual(
+            per_response["speaker_observations"]["possible_second_speaker_intervals"],
+            additional_speaker_intervals,
+        )
+        self.assertEqual(
+            per_response["speaker_observations"]["overlapping_speech_intervals"],
+            overlap_intervals,
+        )
+
     def test_observations_do_not_modify_scores(self):
         merge = load_merge_function()
         assessment = {"overall_interview_score": 83, "answer_assessments": [{"score": 83}]}

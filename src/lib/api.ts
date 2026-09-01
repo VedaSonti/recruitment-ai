@@ -601,6 +601,12 @@ export async function getInterviewByMatch(matchId: string): Promise<{
   });
 }
 
+export async function retryInterviewAssessment(matchId: string): Promise<void> {
+  await request(`/interviews/by-match/${encodeURIComponent(matchId)}/assess-video`, {
+    method: "POST",
+  });
+}
+
 export function runMatchingAnalysis(jobId: string): Promise<{
   job_id: string;
   matched_candidates: number;

@@ -15,6 +15,7 @@ import {
   getMatchesByJob,
   isAPIError,
   prepareProfileUplift,
+  retryInterviewAssessment,
   scheduleInterview,
   updateMatchStatus,
   type Job,
@@ -34,6 +35,10 @@ import {
 
 type Disposition = "" | "Willing" | "Not Willing" | "No Show / Disappeared";
 type InterviewResult = Awaited<ReturnType<typeof getInterviewByMatch>>;
+
+function interviewAssessmentNeedsWork(result: InterviewResult): boolean {
+  return !result.assessment || result.video_analysis_status !== "completed";
+}
 
 const API_BASE_URL = (
   process.env.NEXT_PUBLIC_API_URL?.trim() || "/api/backend"
@@ -447,6 +452,16 @@ export default function CandidateReviewPage() {
       setActiveInterviewMatchId(id);
       setShowInterviewModal(true);
       setRowLoading(id, { viewingResults: false });
+      if (interviewAssessmentNeedsWork(result as InterviewResult)) {
+        void retryInterviewAssessment(id)
+          .then(() => getInterviewByMatch(id))
+          .then((updated) => setInterviewResult(updated as InterviewResult))
+          .catch((error) => {
+            console.error("[interview-assessment] Resume request failed", {
+              errorType: error instanceof Error ? error.name : "UnknownError",
+            });
+          });
+      }
     } catch (error) {
       setRowLoading(id, {
         bannerMessage: error instanceof Error ? error.message : "Failed to load interview results.",
@@ -464,6 +479,9 @@ export default function CandidateReviewPage() {
     setIsRefreshingInterview(true);
 
     try {
+      if (interviewResult && interviewAssessmentNeedsWork(interviewResult)) {
+        await retryInterviewAssessment(activeInterviewMatchId);
+      }
       const result = await getInterviewByMatch(activeInterviewMatchId);
       setInterviewResult(result as InterviewResult);
       await refreshMatchesForCurrentJob();
