@@ -9,6 +9,7 @@ out/
 # Candidate interview recordings are local runtime data and must never be committed.
 backend/media/
 backend/models/**/*.task
+!backend/models/mediapipe/face_landmarker.task
 backend/models/**/*.tflite
 backend/models/**/*.onnx
 backend/.venv/

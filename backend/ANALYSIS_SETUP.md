@@ -17,13 +17,17 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-FFmpeg must remain available on `PATH`. The analyzer invokes it only after a
-recording has been uploaded and stored.
+Local FFmpeg on `PATH` remains preferred. In production, the platform-specific
+`imageio-ffmpeg` wheel supplies a packaged binary when no system executable is
+available. The analyzer invokes it only after a recording has been uploaded and
+stored. `IMAGEIO_FFMPEG_EXE` may optionally override the packaged executable.
 
 ## MediaPipe Face Landmarker
 
-The implementation uses the MediaPipe Tasks Face Landmarker in VIDEO mode. It
-requires the official task model, which is deliberately excluded from Git.
+The implementation uses the MediaPipe Tasks Face Landmarker in VIDEO mode. The
+official task model at `models/mediapipe/face_landmarker.task` is deliberately
+packaged with the backend so serverless deployments do not depend on a
+developer-machine-only download.
 
 ```powershell
 New-Item -ItemType Directory -Force .\models\mediapipe
@@ -38,7 +42,8 @@ Set this in `backend/.env` (the path is resolved from the repository root):
 FACE_LANDMARKER_MODEL_PATH=backend/models/mediapipe/face_landmarker.task
 ```
 
-Do not add the `.task` binary to Git.
+If the model is replaced, use the same official Google MediaPipe model source
+and verify the replacement before deployment.
 
 ## pyannote Community-1 diarisation
 

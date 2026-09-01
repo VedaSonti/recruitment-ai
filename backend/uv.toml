@@ -1,0 +1,7 @@
+# MediaPipe declares the GUI-enabled OpenCV distribution unconditionally.
+# Vercel's headless Linux runtime does not provide its libGL/X11 dependencies,
+# so replace that transitive requirement on Linux with the explicitly declared
+# headless distribution in requirements.txt. Local Windows installs are unchanged.
+override-dependencies = [
+    "opencv-contrib-python==5.0.0.93 ; sys_platform != 'linux'",
+]

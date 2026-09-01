@@ -98,6 +98,19 @@ def face_landmarker_model_path() -> Path:
     )
 
 
+def _resolve_ffmpeg_executable() -> Optional[str]:
+    """Prefer local PATH FFmpeg, then the packaged serverless-safe binary."""
+    path_executable = shutil.which("ffmpeg")
+    if path_executable:
+        return path_executable
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except (ImportError, OSError, RuntimeError, ValueError):
+        return None
+
+
 def _package_available(name: str, verify_import: bool = False) -> bool:
     try:
         if verify_import:
@@ -724,7 +737,7 @@ def analyze_speakers(
         }
         return result
 
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = _resolve_ffmpeg_executable()
     if not ffmpeg:
         result = aggregate_diarization_segments([], 0, config)
         result.update(status="model_unavailable", status_reason="FFmpeg is unavailable for diarisation audio extraction.")

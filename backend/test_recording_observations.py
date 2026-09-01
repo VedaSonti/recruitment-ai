@@ -1,11 +1,13 @@
 import ast
 import copy
+import hashlib
 import os
 import sys
 import tempfile
 import types
 import unittest
 import warnings
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -78,6 +80,21 @@ def load_merge_function():
 
 
 class HeadOrientationTests(unittest.TestCase):
+    def test_official_face_landmarker_model_is_packaged(self):
+        model_path = observations.face_landmarker_model_path()
+        self.assertTrue(model_path.is_file())
+        self.assertEqual(
+            hashlib.sha256(model_path.read_bytes()).hexdigest(),
+            "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff",
+        )
+
+    def test_missing_mediapipe_package_is_explicit(self):
+        fake_cv2 = types.ModuleType("cv2")
+        with patch.dict(sys.modules, {"cv2": fake_cv2, "mediapipe": None}):
+            result = observations.analyze_head_pose("recording.webm", CONFIG)
+        self.assertEqual(result["status"], "model_unavailable")
+        self.assertIn("package is missing", result["status_reason"])
+
     def test_stable_forward_facing_candidate(self):
         result = aggregate_head_pose_samples(face_samples([2.0] * 10), CONFIG)
         self.assertEqual(result["status"], "completed")
@@ -159,8 +176,131 @@ class HeadOrientationTests(unittest.TestCase):
         self.assertEqual(result["status"], "model_unavailable")
         self.assertIn("could not be loaded", result["status_reason"])
 
+    def test_face_landmarker_successfully_analyzes_a_visible_frame(self):
+        landmarks = [types.SimpleNamespace(x=0.5, y=0.5) for _ in range(300)]
+
+        class FakeLandmarker:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def detect_for_video(self, _image, _timestamp_ms):
+                return types.SimpleNamespace(face_landmarks=[landmarks])
+
+        class FakeCapture:
+            def __init__(self):
+                self.frames = [observations.np.zeros((10, 10, 3), dtype=observations.np.uint8)]
+
+            def isOpened(self):
+                return True
+
+            def read(self):
+                return (True, self.frames.pop(0)) if self.frames else (False, None)
+
+            def get(self, _property):
+                return 0.0
+
+            def release(self):
+                return None
+
+        fake_vision = types.SimpleNamespace(
+            RunningMode=types.SimpleNamespace(VIDEO="VIDEO"),
+            FaceLandmarkerOptions=lambda **kwargs: kwargs,
+            FaceLandmarker=types.SimpleNamespace(
+                create_from_options=lambda _options: FakeLandmarker()
+            ),
+        )
+        fake_mp = types.ModuleType("mediapipe")
+        fake_mp.tasks = types.SimpleNamespace(
+            vision=fake_vision,
+            BaseOptions=lambda **kwargs: kwargs,
+        )
+        fake_mp.Image = lambda **kwargs: kwargs
+        fake_mp.ImageFormat = types.SimpleNamespace(SRGB="SRGB")
+        fake_cv2 = types.ModuleType("cv2")
+        fake_cv2.CAP_PROP_POS_MSEC = 0
+        fake_cv2.COLOR_BGR2RGB = 1
+        fake_cv2.SOLVEPNP_ITERATIVE = 0
+        fake_cv2.VideoCapture = lambda _path: FakeCapture()
+        fake_cv2.cvtColor = lambda frame, _conversion: frame
+        fake_cv2.solvePnP = lambda *_args, **_kwargs: (
+            True,
+            observations.np.zeros((3, 1)),
+            None,
+        )
+        successful_config = replace(CONFIG, min_valid_face_frames=1)
+
+        with tempfile.NamedTemporaryFile(suffix=".task") as model_file, patch.dict(
+            sys.modules, {"cv2": fake_cv2, "mediapipe": fake_mp}
+        ), patch.object(
+            observations, "face_landmarker_model_path", return_value=Path(model_file.name)
+        ), patch.object(
+            observations, "_rotation_angles", return_value=(0.0, 0.0, 0.0)
+        ):
+            result = observations.analyze_head_pose("recording.webm", successful_config)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["sampled_frame_count"], 1)
+        self.assertEqual(result["valid_face_frame_count"], 1)
+
 
 class SpeakerDiarizationTests(unittest.TestCase):
+    def test_ffmpeg_unavailable_is_explicit(self):
+        with patch.object(
+            observations, "_resolve_ffmpeg_executable", return_value=None
+        ):
+            result = observations.analyze_speakers("recording.webm", CONFIG)
+        self.assertEqual(result["status"], "model_unavailable")
+        self.assertIn("FFmpeg is unavailable", result["status_reason"])
+
+    def test_ffmpeg_resolver_falls_back_to_packaged_binary(self):
+        fake_imageio_ffmpeg = types.ModuleType("imageio_ffmpeg")
+        fake_imageio_ffmpeg.get_ffmpeg_exe = lambda: "/var/task/ffmpeg-linux-x86_64"
+        with patch.object(observations.shutil, "which", return_value=None), patch.dict(
+            sys.modules, {"imageio_ffmpeg": fake_imageio_ffmpeg}
+        ):
+            executable = observations._resolve_ffmpeg_executable()
+        self.assertEqual(executable, "/var/task/ffmpeg-linux-x86_64")
+
+    def test_successful_audio_extraction_uses_resolved_ffmpeg(self):
+        completed_process = types.SimpleNamespace(returncode=0)
+        run = Mock(return_value=completed_process)
+        pipeline = Mock(return_value="diarization-output")
+        with patch.object(
+            observations,
+            "_resolve_ffmpeg_executable",
+            return_value="/var/task/ffmpeg-linux-x86_64",
+        ), patch.object(
+            observations, "_package_available", return_value=True
+        ), patch.object(
+            observations.subprocess, "run", run
+        ), patch.object(
+            observations,
+            "_load_pcm_waveform",
+            return_value=({"waveform": "samples", "sample_rate": 16000}, 30.0),
+        ), patch.object(
+            observations, "_load_speaker_pipeline", return_value=pipeline
+        ), patch.object(
+            observations,
+            "_diarization_segments",
+            return_value=[speaker_segment(0, 29.0, "SPEAKER_00")],
+        ), patch.dict(
+            os.environ, {"HUGGINGFACE_TOKEN": "test-token"}, clear=False
+        ):
+            result = observations.analyze_speakers("recording.webm", CONFIG)
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "/var/task/ffmpeg-linux-x86_64")
+        self.assertEqual(command[command.index("-ac") + 1], "1")
+        self.assertEqual(command[command.index("-ar") + 1], "16000")
+        self.assertEqual(command[command.index("-c:a") + 1], "pcm_s16le")
+        pipeline.assert_called_once_with(
+            {"waveform": "samples", "sample_rate": 16000}
+        )
+        self.assertEqual(result["status"], "completed")
+
     def test_pcm_waveform_loading_avoids_torchcodec(self):
         class FakeTensor:
             def unsqueeze(self, dimension):
