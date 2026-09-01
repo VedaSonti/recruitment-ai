@@ -40,6 +40,10 @@ function interviewAssessmentNeedsWork(result: InterviewResult): boolean {
   return !result.assessment || result.video_analysis_status !== "completed";
 }
 
+function interviewAssessmentShouldAutoContinue(result: InterviewResult): boolean {
+  return result.video_analysis_status === "pending" || result.video_analysis_status === "processing";
+}
+
 const API_BASE_URL = (
   process.env.NEXT_PUBLIC_API_URL?.trim() || "/api/backend"
 ).replace(/\/+$/, "");
@@ -128,6 +132,38 @@ export default function CandidateReviewPage() {
       mounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (
+      !showInterviewModal ||
+      !activeInterviewMatchId ||
+      !interviewResult ||
+      !interviewAssessmentShouldAutoContinue(interviewResult)
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void retryInterviewAssessment(activeInterviewMatchId)
+        .then(() => getInterviewByMatch(activeInterviewMatchId))
+        .then((updated) => {
+          if (!cancelled) {
+            setInterviewResult(updated as InterviewResult);
+          }
+        })
+        .catch((error) => {
+          console.error("[interview-assessment] Automatic continuation failed", {
+            errorType: error instanceof Error ? error.name : "UnknownError",
+          });
+        });
+    }, 10000);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [activeInterviewMatchId, interviewResult, showInterviewModal]);
 
   useEffect(() => {
     let mounted = true;

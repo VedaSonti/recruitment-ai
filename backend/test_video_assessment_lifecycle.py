@@ -88,7 +88,14 @@ class FakeCollection:
 def load_lifecycle_helpers(collection):
     source_path = Path(__file__).with_name("main.py")
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
-    wanted_functions = {"claim_video_assessment", "fail_video_assessment_claim"}
+    wanted_functions = {
+        "claim_video_assessment",
+        "fail_video_assessment_claim",
+        "release_video_assessment_claim",
+        "recording_observations_from_progress",
+        "next_recording_response",
+        "next_recording_stage",
+    }
     nodes = []
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
@@ -145,6 +152,29 @@ def interview_document(**overrides):
 
 
 class VideoAssessmentLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def test_run_function_returns_after_one_recording_analysis(self):
+        source_path = Path(__file__).with_name("main.py")
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        run_function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_claimed_video_assessment"
+        )
+        recording_loops = [
+            node
+            for node in ast.walk(run_function)
+            if isinstance(node, ast.For)
+            and any(
+                isinstance(nested, ast.Call)
+                and isinstance(nested.func, ast.Name)
+                and nested.func.id == "analyze_recording"
+                for nested in ast.walk(node)
+            )
+        ]
+
+        self.assertEqual(len(recording_loops), 1)
+        self.assertTrue(any(isinstance(node, ast.Return) for node in ast.walk(recording_loops[0])))
+
     async def test_stale_processing_claim_is_recovered_atomically(self):
         now = datetime.now(timezone.utc)
         collection = FakeCollection(
@@ -199,6 +229,81 @@ class VideoAssessmentLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(claimed)
         self.assertEqual(collection.document["video_analysis_claim_id"], "active-worker")
+
+    async def test_checkpoint_releases_claim_and_next_question_can_continue_immediately(self):
+        now = datetime.now(timezone.utc)
+        responses = [
+            {"question_index": index, "transcript": f"Answer {index}"}
+            for index in range(5)
+        ]
+        collection = FakeCollection(
+            interview_document(
+                responses=responses,
+                video_analysis_status="processing",
+                video_analysis_claim_id="q0-worker",
+                video_analysis_started_at=now,
+            )
+        )
+        helpers = load_lifecycle_helpers(collection)
+        timestamped_observation = {
+            "head_orientation": {
+                "status": "completed",
+                "head_observation_intervals": [
+                    {"type": "face_absent", "start_seconds": 22.6, "end_seconds": 24.7}
+                ],
+                "rapid_movement_events": [
+                    {"movement_type": "yaw", "time_seconds": 27.3, "delta_degrees": 31.0}
+                ],
+            },
+            "speaker_observations": {
+                "status": "completed",
+                "possible_second_speaker_intervals": [
+                    {"speaker_label": "SPEAKER_00", "start_seconds": 2.0, "end_seconds": 5.0}
+                ],
+                "overlapping_speech_intervals": [
+                    {"start_seconds": 24.5, "end_seconds": 26.8}
+                ],
+            },
+        }
+
+        released = await helpers["release_video_assessment_claim"](
+            token="token-1",
+            claim_id="q0-worker",
+            stage="recording_observation_0_completed",
+            next_stage="recording_observation_1",
+            checkpoint={
+                "video_analysis_progress.recording_observations_by_question.0": timestamped_observation
+            },
+        )
+
+        self.assertEqual(released["video_analysis_status"], "pending")
+        self.assertNotIn("video_analysis_claim_id", released)
+        stored = helpers["recording_observations_from_progress"](released)
+        self.assertEqual(stored[0], timestamped_observation)
+        self.assertEqual(helpers["next_recording_response"](responses, stored)["question_index"], 1)
+
+        next_claim = await helpers["claim_video_assessment"](
+            released,
+            now=now + timedelta(seconds=1),
+            claim_id="q1-worker",
+        )
+        self.assertIsNotNone(next_claim)
+        self.assertEqual(next_claim["video_analysis_claim_id"], "q1-worker")
+
+    def test_five_question_progress_never_repeats_completed_questions(self):
+        collection = FakeCollection(interview_document())
+        helpers = load_lifecycle_helpers(collection)
+        responses = [{"question_index": index} for index in range(5)]
+        completed = {}
+        observed_order = []
+
+        for _ in range(5):
+            response = helpers["next_recording_response"](responses, completed)
+            observed_order.append(response["question_index"])
+            completed[response["question_index"]] = {"head_orientation": {}, "speaker_observations": {}}
+
+        self.assertEqual(observed_order, [0, 1, 2, 3, 4])
+        self.assertIsNone(helpers["next_recording_response"](responses, completed))
 
     async def test_exception_releases_claim_and_preserves_completed_answer_score(self):
         assessment = {"overall_interview_score": 82, "summary": "Completed answer score."}

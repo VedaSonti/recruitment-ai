@@ -2658,6 +2658,76 @@ async def claim_video_assessment(interview: dict, *, now: datetime, claim_id: st
     )
 
 
+async def release_video_assessment_claim(
+    *,
+    token: str,
+    claim_id: str,
+    stage: str,
+    next_stage: str,
+    checkpoint: Optional[dict] = None,
+) -> dict:
+    """Persist one bounded stage and make the next stage immediately claimable."""
+    now = datetime.now(timezone.utc)
+    set_values = {
+        "video_analysis_status": "pending",
+        "video_analysis_heartbeat_at": now,
+        "video_analysis_stage": stage,
+        "video_analysis_progress.next_stage": next_stage,
+        **(checkpoint or {}),
+    }
+    released = await interviews_collection.find_one_and_update(
+        {
+            "token": token,
+            "video_analysis_status": "processing",
+            "video_analysis_claim_id": claim_id,
+        },
+        {
+            "$set": set_values,
+            "$unset": {"video_analysis_claim_id": ""},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if not released:
+        raise RuntimeError("Video assessment claim was lost before checkpoint persistence")
+    return released
+
+
+def recording_observations_from_progress(interview: dict) -> dict[int, dict]:
+    progress = interview.get("video_analysis_progress") or {}
+    raw_recording_progress = progress.get("recording_observations_by_question") or {}
+    return {
+        int(question_index): observation
+        for question_index, observation in raw_recording_progress.items()
+        if str(question_index).isdigit() and isinstance(observation, dict)
+    }
+
+
+def next_recording_response(
+    responses: list[dict],
+    recording_observations_by_question: dict[int, dict],
+) -> Optional[dict]:
+    return next(
+        (
+            response
+            for response in responses
+            if response.get("question_index") not in recording_observations_by_question
+        ),
+        None,
+    )
+
+
+def next_recording_stage(
+    responses: list[dict],
+    recording_observations_by_question: dict[int, dict],
+) -> str:
+    pending = next_recording_response(responses, recording_observations_by_question)
+    return (
+        f"recording_observation_{pending.get('question_index')}"
+        if pending
+        else "visual_observations"
+    )
+
+
 async def fail_video_assessment_claim(
     *,
     token: str,
@@ -2760,7 +2830,6 @@ async def assess_interview_with_video(token: str):
 
 
 async def run_claimed_video_assessment(token: str, interview: dict, claim_id: str) -> dict:
-    pipeline_started = time.monotonic()
     responses = [dict(response) for response in interview.get("responses", [])]
 
     job = await jobs_collection.find_one({"_id": interview["job_id"]})
@@ -2782,30 +2851,27 @@ async def run_claimed_video_assessment(token: str, interview: dict, claim_id: st
         answer_started = time.monotonic()
         assessment = generate_interview_answer_assessment(interview, job, qa_text)
         pipeline_timing["answer_assessment_seconds"] = time.monotonic() - answer_started
-        persistence_started = time.monotonic()
-        await interviews_collection.update_one(
-            {
-                "token": token,
-                "video_analysis_status": "processing",
-                "video_analysis_claim_id": claim_id,
-            },
-            {
-                "$set": {
-                    "assessment": assessment,
-                    "video_analysis_heartbeat_at": datetime.now(timezone.utc),
-                    "video_analysis_stage": "answer_assessment_completed",
-                }
-            },
+        recording_observations_by_question = recording_observations_from_progress(interview)
+        released = await release_video_assessment_claim(
+            token=token,
+            claim_id=claim_id,
+            stage="answer_assessment_completed",
+            next_stage=next_recording_stage(responses, recording_observations_by_question),
+            checkpoint={"assessment": assessment},
         )
-        pipeline_timing["persistence_seconds"] += time.monotonic() - persistence_started
+        print(
+            "[video assessment stage] "
+            f"interview_id={interview['_id']} stage=answer_assessment_completed "
+            f"answer_assessment_seconds={pipeline_timing['answer_assessment_seconds']:.3f} "
+            f"next_stage={next_recording_stage(responses, recording_observations_by_question)}"
+        )
+        return video_assessment_response(
+            released,
+            "Answer assessment checkpointed; more video assessment work remains.",
+        )
 
     progress = interview.get("video_analysis_progress") or {}
-    raw_recording_progress = progress.get("recording_observations_by_question") or {}
-    recording_observations_by_question = {
-        int(question_index): observation
-        for question_index, observation in raw_recording_progress.items()
-        if str(question_index).isdigit() and isinstance(observation, dict)
-    }
+    recording_observations_by_question = recording_observations_from_progress(interview)
     observation_timing_totals = {
         "ffmpeg_seconds": 0.0,
         "head_analysis_seconds": 0.0,
@@ -2883,33 +2949,54 @@ async def run_claimed_video_assessment(token: str, interview: dict, claim_id: st
                 observation_timing.get(timing_name, 0.0) or 0.0
             )
         recording_observations_by_question[question_index] = recording_observations
-        persistence_started = time.monotonic()
-        await interviews_collection.update_one(
-            {
-                "token": token,
-                "video_analysis_status": "processing",
-                "video_analysis_claim_id": claim_id,
-            },
-            {
-                "$set": {
-                    f"video_analysis_progress.recording_observations_by_question.{question_index}": recording_observations,
-                    "responses": responses,
-                    "video_analysis_heartbeat_at": datetime.now(timezone.utc),
-                    "video_analysis_stage": f"recording_observation_{question_index}_completed",
-                }
+        next_stage = next_recording_stage(responses, recording_observations_by_question)
+        released = await release_video_assessment_claim(
+            token=token,
+            claim_id=claim_id,
+            stage=f"recording_observation_{question_index}_completed",
+            next_stage=next_stage,
+            checkpoint={
+                f"video_analysis_progress.recording_observations_by_question.{question_index}": recording_observations,
+                "responses": responses,
             },
         )
-        pipeline_timing["persistence_seconds"] += time.monotonic() - persistence_started
         head = recording_observations.get("head_orientation") or {}
         speaker = recording_observations.get("speaker_observations") or {}
         elapsed = (datetime.now(timezone.utc) - observation_started).total_seconds()
+        head_intervals = head.get("head_observation_intervals") or []
+        head_events = head.get("rapid_movement_events") or []
+        speaker_intervals = speaker.get("possible_second_speaker_intervals") or []
+        overlap_intervals = speaker.get("overlapping_speech_intervals") or []
         print(
-            "[recording observations] "
+            "[recording observations checkpoint] "
             f"interview_id={interview['_id']} q={question_index} "
             f"sampled_frames={head.get('sampled_frame_count', 0)} "
             f"valid_face_frames={head.get('valid_face_frame_count', 0)} "
-            f"head_status={head.get('status')} speaker_status={speaker.get('status')} "
-            f"analysis_seconds={elapsed:.2f}"
+            f"head_status={head.get('status')} head_intervals={len(head_intervals)} "
+            f"head_events={len(head_events)} speaker_status={speaker.get('status')} "
+            f"speaker_intervals={len(speaker_intervals)} overlap_intervals={len(overlap_intervals)} "
+            f"blob_materialization_seconds={pipeline_timing['blob_materialization_seconds']:.3f} "
+            f"ffmpeg_seconds={observation_timing_totals['ffmpeg_seconds']:.3f} "
+            f"head_analysis_seconds={observation_timing_totals['head_analysis_seconds']:.3f} "
+            f"speaker_model_load_seconds={observation_timing_totals['speaker_model_load_seconds']:.3f} "
+            f"speaker_inference_seconds={observation_timing_totals['speaker_inference_seconds']:.3f} "
+            f"analysis_seconds={elapsed:.2f} next_stage={next_stage}"
+        )
+        return video_assessment_response(
+            released,
+            f"Recording observations for question {question_index} checkpointed; more assessment work remains.",
+        )
+
+    if progress.get("visual_observations_completed"):
+        return await run_cv_consistency_or_finalize_stage(
+            token=token,
+            interview=interview,
+            claim_id=claim_id,
+            job=job,
+            candidate=candidate,
+            responses=responses,
+            qa_text=qa_text,
+            assessment=assessment,
         )
 
     all_frame_items = []
@@ -3064,33 +3151,35 @@ Return ONLY valid JSON in this exact shape:
 
     updated_responses = apply_video_observations_to_responses(responses, video_analysis)
 
-    persistence_started = time.monotonic()
-    await interviews_collection.update_one(
-        {
-            "token": token,
-            "video_analysis_status": "processing",
-            "video_analysis_claim_id": claim_id,
-        },
-        {
-            "$set": {
-                "responses": updated_responses,
-                "video_analysis": video_analysis,
-                "video_analysis_heartbeat_at": datetime.now(timezone.utc),
-                "video_analysis_stage": "video_observations_completed",
-            }
+    released = await release_video_assessment_claim(
+        token=token,
+        claim_id=claim_id,
+        stage="video_observations_completed",
+        next_stage="cv_consistency",
+        checkpoint={
+            "responses": updated_responses,
+            "video_analysis": video_analysis,
+            "video_analysis_progress.visual_observations_completed": True,
         },
     )
-    pipeline_timing["persistence_seconds"] += time.monotonic() - persistence_started
+    print(
+        "[video assessment stage] "
+        f"interview_id={interview['_id']} stage=video_observations_completed "
+        f"visual_assessment_seconds={pipeline_timing['visual_assessment_seconds']:.3f} "
+        f"next_stage=cv_consistency"
+    )
+    return video_assessment_response(
+        released,
+        "Video observations checkpointed; CV consistency remains.",
+    )
 
-    cv_consistency = interview.get("cv_consistency")
-    if not cv_consistency:
-        consistency_started = time.monotonic()
-        cv_raw = candidate.get("cv_raw", "") if candidate else ""
-        cand_skills = candidate.get("skills", []) if candidate else []
-        cand_years = candidate.get("years_experience", 0) if candidate else 0
-        cand_summary = candidate.get("summary", "") if candidate else ""
 
-        consistency_prompt = f"""You are checking whether a candidate's interview answers
+def generate_cv_consistency(candidate: Optional[dict], qa_text: str) -> dict:
+    cv_raw = candidate.get("cv_raw", "") if candidate else ""
+    cand_skills = candidate.get("skills", []) if candidate else []
+    cand_years = candidate.get("years_experience", 0) if candidate else 0
+    cand_summary = candidate.get("summary", "") if candidate else ""
+    consistency_prompt = f"""You are checking whether a candidate's interview answers
 are consistent with their CV claims.
 
 CV SUMMARY: {cand_summary}
@@ -3132,20 +3221,68 @@ Return ONLY valid JSON:
     }}
   ]
 }}"""
+    consistency_response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": consistency_prompt}],
+        temperature=0.2,
+    )
+    return json.loads(strip_json_fences(consistency_response.choices[0].message.content))
 
-        try:
-            consistency_response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": consistency_prompt}],
-                temperature=0.2,
-            )
-            cv_consistency = json.loads(strip_json_fences(consistency_response.choices[0].message.content))
-        except Exception as e:
-            print(f"[cv consistency] Failed: {e}")
-            cv_consistency = {"error": "CV consistency check could not be completed"}
-        finally:
-            pipeline_timing["cv_consistency_seconds"] = time.monotonic() - consistency_started
 
+async def run_cv_consistency_or_finalize_stage(
+    *,
+    token: str,
+    interview: dict,
+    claim_id: str,
+    job: Optional[dict],
+    candidate: Optional[dict],
+    responses: list[dict],
+    qa_text: str,
+    assessment: dict,
+) -> dict:
+    del job  # Reserved for future bounded stages; scoring inputs remain unchanged.
+    progress = interview.get("video_analysis_progress") or {}
+    if not progress.get("cv_consistency_completed"):
+        consistency_started = time.monotonic()
+        cv_consistency = interview.get("cv_consistency")
+        if not cv_consistency:
+            try:
+                cv_consistency = generate_cv_consistency(candidate, qa_text)
+            except Exception as consistency_error:
+                print(
+                    "[cv consistency] failed "
+                    f"interview_id={interview['_id']} "
+                    f"error_type={type(consistency_error).__name__}"
+                )
+                cv_consistency = {"error": "CV consistency check could not be completed"}
+        elapsed = time.monotonic() - consistency_started
+        released = await release_video_assessment_claim(
+            token=token,
+            claim_id=claim_id,
+            stage="cv_consistency_completed",
+            next_stage="finalize",
+            checkpoint={
+                "cv_consistency": cv_consistency,
+                "video_analysis_progress.cv_consistency_completed": True,
+            },
+        )
+        print(
+            "[video assessment stage] "
+            f"interview_id={interview['_id']} stage=cv_consistency_completed "
+            f"cv_consistency_seconds={elapsed:.3f} next_stage=finalize"
+        )
+        return video_assessment_response(
+            released,
+            "CV consistency checkpointed; final persistence remains.",
+        )
+
+    video_analysis = interview.get("video_analysis") or build_unavailable_video_analysis(
+        "Video observations were not available at final persistence.",
+        responses,
+        status="failed" if any(response_has_video(response) for response in responses) else "unavailable",
+        video_available=any(response_has_video(response) for response in responses),
+    )
+    cv_consistency = interview.get("cv_consistency")
     now = datetime.now(timezone.utc)
     persistence_started = time.monotonic()
     final_update = await interviews_collection.update_one(
@@ -3154,49 +3291,39 @@ Return ONLY valid JSON:
             "video_analysis_status": "processing",
             "video_analysis_claim_id": claim_id,
         },
-        {"$set": {
-            "responses": updated_responses,
-            "assessment": assessment,
-            "video_analysis": video_analysis,
-            "video_analysis_status": video_analysis.get("video_analysis_status", "completed"),
-            "cv_consistency": cv_consistency,
-            "status": "Assessed",
-            "assessed_at": now.isoformat(),
-            "video_analysis_finished_at": now,
-            "video_analysis_heartbeat_at": now,
-            "video_analysis_stage": "completed",
-        }, "$unset": {
-            "video_analysis_claim_id": "",
-            "video_analysis_progress": "",
-            "video_analysis_last_error": "",
-        }}
+        {
+            "$set": {
+                "responses": responses,
+                "assessment": assessment,
+                "video_analysis": video_analysis,
+                "video_analysis_status": video_analysis.get("video_analysis_status", "completed"),
+                "cv_consistency": cv_consistency,
+                "status": "Assessed",
+                "assessed_at": now.isoformat(),
+                "video_analysis_finished_at": now,
+                "video_analysis_heartbeat_at": now,
+                "video_analysis_stage": "completed",
+            },
+            "$unset": {
+                "video_analysis_claim_id": "",
+                "video_analysis_progress": "",
+                "video_analysis_last_error": "",
+            },
+        },
     )
     if getattr(final_update, "modified_count", 1) == 0:
         raise RuntimeError("Video assessment claim was lost before final persistence")
 
     await matches_collection.update_one(
         {"_id": interview["match_id"]},
-        {"$set": {"status": "Interview Completed", "updated_at": now}}
+        {"$set": {"status": "Interview Completed", "updated_at": now}},
     )
-    pipeline_timing["persistence_seconds"] += time.monotonic() - persistence_started
-    observation_total_seconds = (
-        time.monotonic() - pipeline_started
-    )
+    persistence_seconds = time.monotonic() - persistence_started
     print(
-        "[recording observations timing] "
-        f"interview_id={interview['_id']} responses={len(responses)} "
-        f"ffmpeg_seconds={observation_timing_totals['ffmpeg_seconds']:.3f} "
-        f"head_analysis_seconds={observation_timing_totals['head_analysis_seconds']:.3f} "
-        f"speaker_model_load_seconds={observation_timing_totals['speaker_model_load_seconds']:.3f} "
-        f"speaker_inference_seconds={observation_timing_totals['speaker_inference_seconds']:.3f} "
-        f"blob_materialization_seconds={pipeline_timing['blob_materialization_seconds']:.3f} "
-        f"answer_assessment_seconds={pipeline_timing['answer_assessment_seconds']:.3f} "
-        f"visual_assessment_seconds={pipeline_timing['visual_assessment_seconds']:.3f} "
-        f"cv_consistency_seconds={pipeline_timing['cv_consistency_seconds']:.3f} "
-        f"persistence_seconds={pipeline_timing['persistence_seconds']:.3f} "
-        f"total_seconds={observation_total_seconds:.3f}"
+        "[video assessment stage] "
+        f"interview_id={interview['_id']} stage=completed "
+        f"persistence_seconds={persistence_seconds:.3f} next_stage=none"
     )
-
     return {
         "message": "Full assessment complete",
         "assessment": assessment,

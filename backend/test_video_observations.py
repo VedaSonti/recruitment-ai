@@ -292,6 +292,18 @@ class VideoObservationSafetyTests(unittest.TestCase):
         source = Path(__file__).with_name("main.py").read_text(encoding="utf-8")
         self.assertIn('"message": "Already assessed"', source)
 
+    def test_candidate_review_renders_detailed_timestamp_observations(self):
+        source = (
+            Path(__file__).parents[1] / "app" / "candidate-review" / "page.tsx"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Review face-absent interval", source)
+        self.assertIn("Review downward-orientation interval", source)
+        self.assertIn("Review ${event.movement_type} movement", source)
+        self.assertIn("Review possible additional speaker", source)
+        self.assertIn("Review overlapping speech", source)
+        self.assertIn("possible_second_speaker_intervals", source)
+        self.assertIn("overlapping_speech_intervals", source)
+
     def test_no_prohibited_labels_in_generated_video_observation_output(self):
         result = normalize_video_analysis_payload(
             sample_raw(
