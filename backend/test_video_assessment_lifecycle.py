@@ -93,8 +93,11 @@ def load_lifecycle_helpers(collection):
         "fail_video_assessment_claim",
         "release_video_assessment_claim",
         "recording_observations_from_progress",
+        "response_observations_with_progress",
         "next_recording_response",
+        "next_recording_work_item",
         "next_recording_stage",
+        "checkpoint_response_observation",
     }
     nodes = []
     for node in tree.body:
@@ -152,7 +155,7 @@ def interview_document(**overrides):
 
 
 class VideoAssessmentLifecycleTests(unittest.IsolatedAsyncioTestCase):
-    def test_run_function_returns_after_one_recording_analysis(self):
+    def test_run_function_uses_independent_head_and_speaker_stages(self):
         source_path = Path(__file__).with_name("main.py")
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
         run_function = next(
@@ -160,20 +163,27 @@ class VideoAssessmentLifecycleTests(unittest.IsolatedAsyncioTestCase):
             for node in tree.body
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_claimed_video_assessment"
         )
-        recording_loops = [
+        recording_calls = {
+            nested.func.id
+            for nested in ast.walk(run_function)
+            if isinstance(nested, ast.Call)
+            and isinstance(nested.func, ast.Name)
+            and nested.func.id in {"analyze_head_pose", "analyze_speakers", "analyze_recording"}
+        }
+        recording_blocks = [
             node
             for node in ast.walk(run_function)
-            if isinstance(node, ast.For)
+            if isinstance(node, ast.If)
             and any(
                 isinstance(nested, ast.Call)
                 and isinstance(nested.func, ast.Name)
-                and nested.func.id == "analyze_recording"
+                and nested.func.id in {"analyze_head_pose", "analyze_speakers"}
                 for nested in ast.walk(node)
             )
         ]
 
-        self.assertEqual(len(recording_loops), 1)
-        self.assertTrue(any(isinstance(node, ast.Return) for node in ast.walk(recording_loops[0])))
+        self.assertEqual(recording_calls, {"analyze_head_pose", "analyze_speakers"})
+        self.assertTrue(any(isinstance(node, ast.Return) for node in ast.walk(recording_blocks[0])))
 
     async def test_stale_processing_claim_is_recovered_atomically(self):
         now = datetime.now(timezone.utc)
@@ -290,20 +300,119 @@ class VideoAssessmentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(next_claim)
         self.assertEqual(next_claim["video_analysis_claim_id"], "q1-worker")
 
-    def test_five_question_progress_never_repeats_completed_questions(self):
+    def test_five_question_progress_runs_all_heads_before_speakers(self):
         collection = FakeCollection(interview_document())
         helpers = load_lifecycle_helpers(collection)
         responses = [{"question_index": index} for index in range(5)]
         completed = {}
         observed_order = []
 
-        for _ in range(5):
-            response = helpers["next_recording_response"](responses, completed)
-            observed_order.append(response["question_index"])
-            completed[response["question_index"]] = {"head_orientation": {}, "speaker_observations": {}}
+        for _ in range(10):
+            stage, response = helpers["next_recording_work_item"](responses, completed)
+            observed_order.append((stage, response["question_index"]))
+            observation = completed.setdefault(response["question_index"], {})
+            observation[
+                "head_orientation" if stage == "head" else "speaker_observations"
+            ] = {}
 
-        self.assertEqual(observed_order, [0, 1, 2, 3, 4])
+        self.assertEqual(
+            observed_order,
+            [("head", question) for question in range(5)]
+            + [("speaker", question) for question in range(5)],
+        )
         self.assertIsNone(helpers["next_recording_response"](responses, completed))
+
+    def test_head_checkpoint_is_visible_while_speaker_is_pending(self):
+        collection = FakeCollection(interview_document())
+        helpers = load_lifecycle_helpers(collection)
+        responses = [{"question_index": 0, "video_observations": {"notes": ["kept"]}}]
+        head = {
+            "status": "completed",
+            "head_observation_intervals": [
+                {"type": "face_absent", "start_seconds": 1.0, "end_seconds": 3.2}
+            ],
+            "rapid_movement_events": [
+                {"movement_type": "yaw", "time_seconds": 4.1}
+            ],
+        }
+
+        helpers["checkpoint_response_observation"](
+            responses, 0, "head_orientation", head
+        )
+
+        self.assertEqual(responses[0]["video_observations"]["head_orientation"], head)
+        self.assertEqual(responses[0]["video_observations"]["notes"], ["kept"])
+        work = helpers["next_recording_work_item"](
+            responses, {0: {"head_orientation": head}}
+        )
+        self.assertEqual((work[0], work[1]["question_index"]), ("speaker", 0))
+
+        recruiter_payload = helpers["response_observations_with_progress"](
+            {"question_index": 0}, {0: {"head_orientation": head}}
+        )
+        self.assertEqual(recruiter_payload["head_orientation"], head)
+        self.assertNotIn("speaker_observations", recruiter_payload)
+
+    def test_speaker_retry_does_not_erase_completed_head_checkpoint(self):
+        collection = FakeCollection(interview_document())
+        helpers = load_lifecycle_helpers(collection)
+        head = {"status": "completed", "head_observation_intervals": [{"start_seconds": 2.0}]}
+        progress = {0: {"head_orientation": head}}
+
+        first = helpers["next_recording_work_item"](
+            [{"question_index": 0}], progress
+        )
+        second = helpers["next_recording_work_item"](
+            [{"question_index": 0}], progress
+        )
+
+        self.assertEqual(first[0], "speaker")
+        self.assertEqual(second[0], "speaker")
+        self.assertEqual(progress[0]["head_orientation"], head)
+
+    async def test_speaker_failure_releases_claim_without_erasing_head_timestamp(self):
+        head = {
+            "status": "completed",
+            "head_observation_intervals": [
+                {"type": "face_absent", "start_seconds": 8.0, "end_seconds": 10.5}
+            ],
+        }
+        response = {
+            "question_index": 0,
+            "transcript": "Preserved transcript",
+            "video_storage_key": "media/interviews/interview-1/0.webm",
+            "video_observations": {"head_orientation": head},
+        }
+        collection = FakeCollection(
+            interview_document(
+                responses=[response],
+                assessment={"overall_interview_score": 80},
+                video_analysis_status="processing",
+                video_analysis_claim_id="speaker-worker",
+                video_analysis_progress={
+                    "recording_observations_by_question": {
+                        "0": {"head_orientation": head}
+                    }
+                },
+            )
+        )
+        helpers = load_lifecycle_helpers(collection)
+
+        await helpers["fail_video_assessment_claim"](
+            token="token-1",
+            claim_id="speaker-worker",
+            responses=[response],
+            error=TimeoutError("speaker stage exceeded its execution window"),
+        )
+
+        stored_head = collection.document["video_analysis_progress"][
+            "recording_observations_by_question"
+        ]["0"]["head_orientation"]
+        self.assertEqual(stored_head, head)
+        self.assertEqual(
+            collection.document["responses"][0]["video_observations"]["head_orientation"],
+            head,
+        )
 
     async def test_exception_releases_claim_and_preserves_completed_answer_score(self):
         assessment = {"overall_interview_score": 82, "summary": "Completed answer score."}

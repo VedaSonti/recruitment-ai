@@ -342,6 +342,8 @@ class SpeakerDiarizationTests(unittest.TestCase):
         fake_pipeline_class = types.SimpleNamespace(
             from_pretrained=Mock(return_value=pipeline)
         )
+        fake_huggingface_hub = types.ModuleType("huggingface_hub")
+        fake_huggingface_hub.snapshot_download = Mock(return_value="/tmp/test-model")
         with patch.object(
             observations, "_speaker_pipeline", None
         ), patch.object(
@@ -350,6 +352,8 @@ class SpeakerDiarizationTests(unittest.TestCase):
             observations,
             "_import_speaker_pipeline_class",
             return_value=fake_pipeline_class,
+        ), patch.dict(
+            sys.modules, {"huggingface_hub": fake_huggingface_hub}
         ), patch.dict(
             os.environ,
             {
@@ -365,6 +369,9 @@ class SpeakerDiarizationTests(unittest.TestCase):
         self.assertIs(first, pipeline)
         self.assertIs(second, pipeline)
         fake_pipeline_class.from_pretrained.assert_called_once()
+        fake_huggingface_hub.snapshot_download.assert_called_once_with(
+            repo_id="test-model", token="test-token"
+        )
         self.assertEqual(pipeline._embedding.reads, 1)
         self.assertFalse(any("degrees of freedom" in str(item.message) for item in caught))
 

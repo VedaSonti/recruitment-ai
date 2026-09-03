@@ -69,7 +69,8 @@ from object_storage import (
 )
 from recording_observations import (
     OBSERVATION_SCHEMA_VERSION,
-    analyze_recording,
+    analyze_head_pose,
+    analyze_speakers,
     recording_analysis_startup_status,
     unavailable_recording_observations,
 )
@@ -1633,15 +1634,19 @@ async def get_interview_by_match(match_id: str):
         or (video_analysis or {}).get("video_analysis_status")
         or ("completed" if video_analysis else "pending")
     )
+    partial_recording_observations = recording_observations_from_progress(interview)
     response_payloads = []
     for response in interview.get("responses", []):
         video_url, video_playback_status = response_video_playback(match_id, response)
+        response_video_observations = response_observations_with_progress(
+            response, partial_recording_observations
+        )
         response_payloads.append({
             "question_index": response.get("question_index"),
             "question": response.get("question"),
             "transcript": response.get("transcript"),
             "submitted_at": response.get("submitted_at"),
-            "video_observations": response.get("video_observations"),
+            "video_observations": response_video_observations or None,
             "video_url": video_url,
             "video_available": response_has_video(response),
             "video_playback_status": video_playback_status,
@@ -2702,30 +2707,74 @@ def recording_observations_from_progress(interview: dict) -> dict[int, dict]:
     }
 
 
+def response_observations_with_progress(
+    response: dict,
+    recording_observations_by_question: dict[int, dict],
+) -> dict:
+    """Merge partial checkpoints into the recruiter-visible response payload."""
+    response_video = dict(response.get("video_observations") or {})
+    partial = recording_observations_by_question.get(response.get("question_index")) or {}
+    for observation_name in ("head_orientation", "speaker_observations"):
+        if isinstance(partial.get(observation_name), dict):
+            response_video[observation_name] = partial[observation_name]
+    return response_video
+
+
 def next_recording_response(
     responses: list[dict],
     recording_observations_by_question: dict[int, dict],
 ) -> Optional[dict]:
-    return next(
-        (
-            response
-            for response in responses
-            if response.get("question_index") not in recording_observations_by_question
-        ),
-        None,
-    )
+    work_item = next_recording_work_item(responses, recording_observations_by_question)
+    return work_item[1] if work_item else None
+
+
+def next_recording_work_item(
+    responses: list[dict],
+    recording_observations_by_question: dict[int, dict],
+) -> Optional[tuple[str, dict]]:
+    """Return one independently checkpointable deterministic-analysis stage."""
+    for response in responses:
+        question_index = response.get("question_index")
+        observation = recording_observations_by_question.get(question_index) or {}
+        if not isinstance(observation.get("head_orientation"), dict):
+            return "head", response
+    # Finish every deterministic head stage before starting the potentially
+    # long-running speaker model, so one speaker timeout cannot starve later
+    # responses of their already-independent head checkpoints.
+    for response in responses:
+        question_index = response.get("question_index")
+        observation = recording_observations_by_question.get(question_index) or {}
+        if not isinstance(observation.get("speaker_observations"), dict):
+            return "speaker", response
+    return None
 
 
 def next_recording_stage(
     responses: list[dict],
     recording_observations_by_question: dict[int, dict],
 ) -> str:
-    pending = next_recording_response(responses, recording_observations_by_question)
+    pending = next_recording_work_item(responses, recording_observations_by_question)
     return (
-        f"recording_observation_{pending.get('question_index')}"
+        f"{pending[0]}_observation_{pending[1].get('question_index')}"
         if pending
         else "visual_observations"
     )
+
+
+def checkpoint_response_observation(
+    responses: list[dict],
+    question_index: int,
+    observation_name: str,
+    observation: dict,
+) -> None:
+    """Expose a completed partial result without waiting for the other stage."""
+    for response in responses:
+        if response.get("question_index") != question_index:
+            continue
+        response_video = dict(response.get("video_observations") or {})
+        response_video[observation_name] = observation
+        response["video_observations"] = response_video
+        return
 
 
 async def fail_video_assessment_claim(
@@ -2876,17 +2925,20 @@ async def run_claimed_video_assessment(token: str, interview: dict, claim_id: st
         "ffmpeg_seconds": 0.0,
         "head_analysis_seconds": 0.0,
         "speaker_model_load_seconds": 0.0,
+        "speaker_model_download_seconds": 0.0,
+        "speaker_model_initialization_seconds": 0.0,
         "speaker_inference_seconds": 0.0,
         "analysis_total_seconds": 0.0,
     }
-    for response in responses:
+    recording_work_item = next_recording_work_item(
+        responses, recording_observations_by_question
+    )
+    if recording_work_item:
+        observation_stage, response = recording_work_item
         question_index = response.get("question_index")
-        if question_index in recording_observations_by_question:
-            print(
-                "[recording observations] resumed checkpoint "
-                f"interview_id={interview['_id']} q={question_index}"
-            )
-            continue
+        observation_name = (
+            "head_orientation" if observation_stage == "head" else "speaker_observations"
+        )
         materialized_recording = None
         recording_path = None
         observation_started = datetime.now(timezone.utc)
@@ -2918,73 +2970,104 @@ async def run_claimed_video_assessment(token: str, interview: dict, claim_id: st
             )
 
         if not recording_path or not recording_path.is_file():
-            recording_observations = unavailable_recording_observations(
+            observation = unavailable_recording_observations(
                 "no_recording",
                 "No stored recording was available for presentation or speaker observations.",
-            )
+            )[observation_name]
         else:
             try:
-                if not response.get("frames_b64"):
+                if observation_stage == "head" and not response.get("frames_b64"):
                     response["frames_b64"] = extract_video_frames(
                         str(recording_path),
                         num_frames=6,
                     )
-                recording_observations = analyze_recording(str(recording_path))
+                if observation_stage == "head":
+                    head_started = time.monotonic()
+                    observation = analyze_head_pose(str(recording_path))
+                    observation_timing_totals["head_analysis_seconds"] = (
+                        time.monotonic() - head_started
+                    )
+                else:
+                    observation = analyze_speakers(str(recording_path))
+                    speaker_timing = observation.pop("_timing", {})
+                    for timing_name in (
+                        "ffmpeg_seconds",
+                        "speaker_model_load_seconds",
+                        "speaker_model_download_seconds",
+                        "speaker_model_initialization_seconds",
+                        "speaker_inference_seconds",
+                    ):
+                        observation_timing_totals[timing_name] = float(
+                            speaker_timing.get(timing_name, 0.0) or 0.0
+                        )
             except Exception as observation_error:
                 print(
-                    "[recording observations] failed "
+                    f"[recording observations] {observation_stage} stage failed "
                     f"interview_id={interview['_id']} q={question_index} "
                     f"error_type={type(observation_error).__name__}"
                 )
-                recording_observations = unavailable_recording_observations(
+                observation = unavailable_recording_observations(
                     "failed",
                     "Optional presentation and speaker analysis failed; transcript, score, and playback remain available.",
-                )
+                )[observation_name]
             finally:
                 if materialized_recording and materialized_recording.temporary:
                     materialized_recording.path.unlink(missing_ok=True)
-        observation_timing = recording_observations.pop("_timing", {})
-        for timing_name in observation_timing_totals:
-            observation_timing_totals[timing_name] += float(
-                observation_timing.get(timing_name, 0.0) or 0.0
-            )
-        recording_observations_by_question[question_index] = recording_observations
+        recording_observations = recording_observations_by_question.setdefault(
+            question_index, {}
+        )
+        recording_observations["observation_schema_version"] = OBSERVATION_SCHEMA_VERSION
+        recording_observations[observation_name] = observation
+        checkpoint_response_observation(
+            responses, question_index, observation_name, observation
+        )
         next_stage = next_recording_stage(responses, recording_observations_by_question)
         released = await release_video_assessment_claim(
             token=token,
             claim_id=claim_id,
-            stage=f"recording_observation_{question_index}_completed",
+            stage=f"{observation_stage}_observation_{question_index}_completed",
             next_stage=next_stage,
             checkpoint={
-                f"video_analysis_progress.recording_observations_by_question.{question_index}": recording_observations,
+                f"video_analysis_progress.recording_observations_by_question.{question_index}.{observation_name}": observation,
+                f"video_analysis_progress.recording_observations_by_question.{question_index}.observation_schema_version": OBSERVATION_SCHEMA_VERSION,
                 "responses": responses,
             },
         )
-        head = recording_observations.get("head_orientation") or {}
-        speaker = recording_observations.get("speaker_observations") or {}
         elapsed = (datetime.now(timezone.utc) - observation_started).total_seconds()
-        head_intervals = head.get("head_observation_intervals") or []
-        head_events = head.get("rapid_movement_events") or []
-        speaker_intervals = speaker.get("possible_second_speaker_intervals") or []
-        overlap_intervals = speaker.get("overlapping_speech_intervals") or []
+        interval_count = len(
+            observation.get(
+                "head_observation_intervals"
+                if observation_stage == "head"
+                else "possible_second_speaker_intervals",
+                [],
+            )
+        )
+        event_count = len(
+            observation.get(
+                "rapid_movement_events"
+                if observation_stage == "head"
+                else "overlapping_speech_intervals",
+                [],
+            )
+        )
         print(
             "[recording observations checkpoint] "
-            f"interview_id={interview['_id']} q={question_index} "
-            f"sampled_frames={head.get('sampled_frame_count', 0)} "
-            f"valid_face_frames={head.get('valid_face_frame_count', 0)} "
-            f"head_status={head.get('status')} head_intervals={len(head_intervals)} "
-            f"head_events={len(head_events)} speaker_status={speaker.get('status')} "
-            f"speaker_intervals={len(speaker_intervals)} overlap_intervals={len(overlap_intervals)} "
+            f"interview_id={interview['_id']} q={question_index} stage={observation_stage} "
+            f"status={observation.get('status')} intervals={interval_count} events={event_count} "
+            f"sampled_frames={observation.get('sampled_frame_count', 0)} "
+            f"valid_face_frames={observation.get('valid_face_frame_count', 0)} "
             f"blob_materialization_seconds={pipeline_timing['blob_materialization_seconds']:.3f} "
             f"ffmpeg_seconds={observation_timing_totals['ffmpeg_seconds']:.3f} "
             f"head_analysis_seconds={observation_timing_totals['head_analysis_seconds']:.3f} "
             f"speaker_model_load_seconds={observation_timing_totals['speaker_model_load_seconds']:.3f} "
+            f"speaker_model_download_seconds={observation_timing_totals['speaker_model_download_seconds']:.3f} "
+            f"speaker_model_initialization_seconds={observation_timing_totals['speaker_model_initialization_seconds']:.3f} "
             f"speaker_inference_seconds={observation_timing_totals['speaker_inference_seconds']:.3f} "
             f"analysis_seconds={elapsed:.2f} next_stage={next_stage}"
         )
         return video_assessment_response(
             released,
-            f"Recording observations for question {question_index} checkpointed; more assessment work remains.",
+            f"{observation_stage.title()} observations for question {question_index} checkpointed; more assessment work remains.",
         )
 
     if progress.get("visual_observations_completed"):

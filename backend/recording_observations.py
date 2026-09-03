@@ -608,6 +608,11 @@ aggregate_speaker_segments = aggregate_diarization_segments
 _speaker_pipeline = None
 _speaker_pipeline_model = None
 _speaker_pipeline_lock = threading.Lock()
+_speaker_pipeline_load_timing = {
+    "speaker_model_download_seconds": 0.0,
+    "speaker_model_initialization_seconds": 0.0,
+    "speaker_model_cache_hit": False,
+}
 _torchcodec_status_reported = False
 
 
@@ -655,18 +660,47 @@ def _validate_speaker_minimum_samples(pipeline) -> int | None:
 
 
 def _load_speaker_pipeline():
-    global _speaker_pipeline, _speaker_pipeline_model
+    global _speaker_pipeline, _speaker_pipeline_model, _speaker_pipeline_load_timing
     token = os.getenv("HUGGINGFACE_TOKEN", "").strip()
     model_name = os.getenv(
         "SPEAKER_DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1"
     ).strip()
     if _speaker_pipeline is not None and _speaker_pipeline_model == model_name:
+        _speaker_pipeline_load_timing = {
+            "speaker_model_download_seconds": 0.0,
+            "speaker_model_initialization_seconds": 0.0,
+            "speaker_model_cache_hit": True,
+        }
+        print("[speaker analysis timing] model_cache_hit=true")
         return _speaker_pipeline
 
     with _speaker_pipeline_lock:
         if _speaker_pipeline is None or _speaker_pipeline_model != model_name:
             Pipeline = _import_speaker_pipeline_class()
-            pipeline = Pipeline.from_pretrained(model_name, token=token)
+            packaged_model = os.getenv("SPEAKER_DIARIZATION_MODEL_PATH", "").strip()
+            download_started = time.monotonic()
+            if packaged_model:
+                checkpoint = Path(packaged_model)
+                if not checkpoint.is_dir():
+                    raise RuntimeError("Configured speaker diarisation model path is unavailable")
+                download_seconds = 0.0
+            else:
+                from huggingface_hub import snapshot_download
+
+                checkpoint = Path(snapshot_download(repo_id=model_name, token=token))
+                download_seconds = time.monotonic() - download_started
+            print(
+                "[speaker analysis timing] "
+                f"model_download_seconds={download_seconds:.3f} "
+                f"model_source={'packaged' if packaged_model else 'huggingface'}"
+            )
+            initialization_started = time.monotonic()
+            pipeline = Pipeline.from_pretrained(checkpoint, token=token)
+            initialization_seconds = time.monotonic() - initialization_started
+            print(
+                "[speaker analysis timing] "
+                f"model_initialization_seconds={initialization_seconds:.3f}"
+            )
             if pipeline is None:
                 raise RuntimeError("speaker pipeline was not loaded")
             device_name = os.getenv("SPEAKER_DIARIZATION_DEVICE", "cpu").strip().lower()
@@ -678,6 +712,19 @@ def _load_speaker_pipeline():
             _validate_speaker_minimum_samples(pipeline)
             _speaker_pipeline = pipeline
             _speaker_pipeline_model = model_name
+            _speaker_pipeline_load_timing = {
+                "speaker_model_download_seconds": download_seconds,
+                "speaker_model_initialization_seconds": initialization_seconds,
+                "speaker_model_cache_hit": False,
+            }
+            print("[speaker analysis timing] model_cache_hit=false")
+        else:
+            _speaker_pipeline_load_timing = {
+                "speaker_model_download_seconds": 0.0,
+                "speaker_model_initialization_seconds": 0.0,
+                "speaker_model_cache_hit": True,
+            }
+            print("[speaker analysis timing] model_cache_hit=true")
     return _speaker_pipeline
 
 
@@ -727,6 +774,8 @@ def analyze_speakers(
     timing = {
         "ffmpeg_seconds": 0.0,
         "speaker_model_load_seconds": 0.0,
+        "speaker_model_download_seconds": 0.0,
+        "speaker_model_initialization_seconds": 0.0,
         "speaker_inference_seconds": 0.0,
     }
 
@@ -782,6 +831,13 @@ def analyze_speakers(
                     timing["speaker_model_load_seconds"] = (
                         time.monotonic() - model_load_started
                     )
+                    timing.update({
+                        name: float(_speaker_pipeline_load_timing.get(name, 0.0) or 0.0)
+                        for name in (
+                            "speaker_model_download_seconds",
+                            "speaker_model_initialization_seconds",
+                        )
+                    })
                 except Exception as model_error:
                     print(f"[speaker analysis] Diarisation model load failed error_type={type(model_error).__name__}")
                     result = aggregate_diarization_segments([], duration, config)
@@ -833,6 +889,12 @@ def analyze_recording(video_path: str, config: ObservationConfig = DEFAULT_CONFI
             "head_analysis_seconds": round(head_seconds, 3),
             "speaker_model_load_seconds": speaker_timing.get(
                 "speaker_model_load_seconds", 0.0
+            ),
+            "speaker_model_download_seconds": speaker_timing.get(
+                "speaker_model_download_seconds", 0.0
+            ),
+            "speaker_model_initialization_seconds": speaker_timing.get(
+                "speaker_model_initialization_seconds", 0.0
             ),
             "speaker_inference_seconds": speaker_timing.get(
                 "speaker_inference_seconds", 0.0
