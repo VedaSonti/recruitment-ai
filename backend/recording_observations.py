@@ -84,18 +84,53 @@ class ObservationConfig:
 DEFAULT_CONFIG = ObservationConfig()
 
 
-def _configured_path(name: str, default: Path) -> Path:
-    configured = Path(os.getenv(name, str(default)))
-    if not configured.is_absolute():
-        configured = PROJECT_ROOT / configured
-    return configured.resolve()
+def face_landmarker_model_resolution() -> dict:
+    """Resolve an optional override without depending on the process cwd."""
+    configured_value = os.getenv("FACE_LANDMARKER_MODEL_PATH", "").strip()
+    packaged_path = (
+        BACKEND_DIR / "models" / "mediapipe" / "face_landmarker.task"
+    ).resolve()
+    configured_path = None
+
+    if configured_value:
+        configured = Path(configured_value)
+        if configured.is_absolute():
+            candidates = [configured.resolve()]
+        else:
+            configured_parts = configured.parts
+            candidates = []
+            # A repository-relative value such as backend/models/... must map
+            # to /var/task/models/... when backend is the Vercel service root.
+            if configured_parts and configured_parts[0].casefold() in {
+                "backend",
+                BACKEND_DIR.name.casefold(),
+            }:
+                candidates.append(BACKEND_DIR.joinpath(*configured_parts[1:]).resolve())
+            candidates.extend([
+                (BACKEND_DIR / configured).resolve(),
+                (PROJECT_ROOT / configured).resolve(),
+            ])
+        configured_path = next(
+            (candidate for candidate in candidates if candidate.is_file()),
+            candidates[0],
+        )
+
+    resolved_path = (
+        configured_path
+        if configured_path is not None and configured_path.is_file()
+        else packaged_path
+    )
+    return {
+        "configured_value": configured_value or None,
+        "configured_path": configured_path,
+        "packaged_path": packaged_path,
+        "resolved_path": resolved_path,
+        "used_packaged_fallback": configured_path is not None and not configured_path.is_file(),
+    }
 
 
 def face_landmarker_model_path() -> Path:
-    return _configured_path(
-        "FACE_LANDMARKER_MODEL_PATH",
-        BACKEND_DIR / "models" / "mediapipe" / "face_landmarker.task",
-    )
+    return face_landmarker_model_resolution()["resolved_path"]
 
 
 def _resolve_ffmpeg_executable() -> Optional[str]:
@@ -128,12 +163,22 @@ def _package_available(name: str, verify_import: bool = False) -> bool:
 def recording_analysis_startup_status() -> dict:
     """Verify package imports and configuration without loading model weights."""
     face_package = _package_available("mediapipe", verify_import=True)
-    face_model = face_landmarker_model_path().is_file()
+    face_model_resolution = face_landmarker_model_resolution()
+    face_model_path = face_model_resolution["resolved_path"]
+    face_model = face_model_path.is_file()
+    face_model_size = face_model_path.stat().st_size if face_model else None
     speaker_package = _package_available("pyannote.audio")
     speaker_token = bool(os.getenv("HUGGINGFACE_TOKEN", "").strip())
     return {
         "face_landmarker_package": "available" if face_package else "missing_package",
         "face_landmarker_model": "available" if face_model else "missing_model",
+        "face_landmarker_configured_path": face_model_resolution["configured_value"],
+        "face_landmarker_resolved_path": str(face_model_path),
+        "face_landmarker_model_exists": face_model,
+        "face_landmarker_model_size_bytes": face_model_size,
+        "face_landmarker_used_packaged_fallback": face_model_resolution[
+            "used_packaged_fallback"
+        ],
         "speaker_diarization_package": "available" if speaker_package else "missing_package",
         "speaker_diarization_token": "configured" if speaker_token else "missing_token",
         "speaker_diarization_model": os.getenv(
@@ -509,6 +554,7 @@ def aggregate_diarization_segments(
         "status_reason": "Speaker diarisation completed.",
         "analysis_method": "pyannote_speaker_diarization",
         "candidate_speech_detected": False,
+        "detected_speaker_labels": [],
         "estimated_speaker_count": None,
         "possible_additional_speaker": False,
         "overlapping_speech_detected": False,
@@ -586,6 +632,7 @@ def aggregate_diarization_segments(
     confidence_label = "high" if additional_confidence >= 0.8 else "moderate" if additional_confidence >= 0.65 else "low"
     base.update(
         candidate_speech_detected=True,
+        detected_speaker_labels=sorted(by_speaker),
         estimated_speaker_count=1 + len(secondary_labels),
         possible_additional_speaker=possible_additional,
         overlapping_speech_detected=overlap_seconds > 0,

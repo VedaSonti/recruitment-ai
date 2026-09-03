@@ -548,6 +548,8 @@ export async function getInterviewByMatch(matchId: string): Promise<{
     areas_to_probe: string[];
   } | null;
   video_analysis_status: "pending" | "processing" | "completed" | "failed" | "unavailable";
+  video_analysis_stage?: string | null;
+  video_analysis_next_stage?: string | null;
   video_analysis: {
     video_analysis_status: "pending" | "processing" | "completed" | "failed" | "unavailable";
     video_observations: {
@@ -664,6 +666,7 @@ export interface SpeakerObservation {
   status_reason: string;
   analysis_method: "pyannote_speaker_diarization";
   candidate_speech_detected: boolean;
+  detected_speaker_labels: string[];
   estimated_speaker_count: number | null;
   possible_additional_speaker: boolean;
   overlapping_speech_detected: boolean;

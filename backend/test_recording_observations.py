@@ -88,6 +88,64 @@ class HeadOrientationTests(unittest.TestCase):
             "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff",
         )
 
+    def test_unset_model_override_uses_source_relative_packaged_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            backend_dir = project_root / "backend"
+            packaged = backend_dir / "models" / "mediapipe" / "face_landmarker.task"
+            packaged.parent.mkdir(parents=True)
+            packaged.write_bytes(b"packaged-model")
+            with patch.object(observations, "BACKEND_DIR", backend_dir), patch.object(
+                observations, "PROJECT_ROOT", project_root
+            ), patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("FACE_LANDMARKER_MODEL_PATH", None)
+                resolution = observations.face_landmarker_model_resolution()
+
+        self.assertEqual(resolution["resolved_path"], packaged.resolve())
+        self.assertIsNone(resolution["configured_value"])
+        self.assertFalse(resolution["used_packaged_fallback"])
+
+    def test_vercel_service_resolves_repository_relative_override_under_task_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            deployment_root = Path(directory) / "var"
+            backend_dir = deployment_root / "task"
+            packaged = backend_dir / "models" / "mediapipe" / "face_landmarker.task"
+            packaged.parent.mkdir(parents=True)
+            packaged.write_bytes(b"packaged-model")
+            with patch.object(observations, "BACKEND_DIR", backend_dir), patch.object(
+                observations, "PROJECT_ROOT", deployment_root
+            ), patch.dict(
+                os.environ,
+                {"FACE_LANDMARKER_MODEL_PATH": "backend/models/mediapipe/face_landmarker.task"},
+                clear=False,
+            ):
+                resolution = observations.face_landmarker_model_resolution()
+
+        self.assertEqual(resolution["resolved_path"], packaged.resolve())
+        self.assertEqual(resolution["configured_path"], packaged.resolve())
+        self.assertFalse(resolution["used_packaged_fallback"])
+
+    def test_invalid_override_falls_back_to_packaged_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            backend_dir = project_root / "backend"
+            packaged = backend_dir / "models" / "mediapipe" / "face_landmarker.task"
+            packaged.parent.mkdir(parents=True)
+            packaged.write_bytes(b"packaged-model")
+            with patch.object(observations, "BACKEND_DIR", backend_dir), patch.object(
+                observations, "PROJECT_ROOT", project_root
+            ), patch.dict(
+                os.environ,
+                {"FACE_LANDMARKER_MODEL_PATH": "missing/custom-face-landmarker.task"},
+                clear=False,
+            ):
+                status = observations.recording_analysis_startup_status()
+
+        self.assertEqual(Path(status["face_landmarker_resolved_path"]), packaged.resolve())
+        self.assertTrue(status["face_landmarker_model_exists"])
+        self.assertEqual(status["face_landmarker_model_size_bytes"], len(b"packaged-model"))
+        self.assertTrue(status["face_landmarker_used_packaged_fallback"])
+
     def test_missing_mediapipe_package_is_explicit(self):
         fake_cv2 = types.ModuleType("cv2")
         with patch.dict(sys.modules, {"cv2": fake_cv2, "mediapipe": None}):
@@ -418,6 +476,7 @@ class SpeakerDiarizationTests(unittest.TestCase):
         segments = [speaker_segment(0, 12, "SPEAKER_00"), speaker_segment(12.3, 29.5, "SPEAKER_00")]
         result = aggregate_diarization_segments(segments, 30.0, CONFIG)
         self.assertEqual(result["estimated_speaker_count"], 1)
+        self.assertEqual(result["detected_speaker_labels"], ["SPEAKER_00"])
         self.assertFalse(result["possible_additional_speaker"])
 
     def test_two_speakers_sequentially(self):

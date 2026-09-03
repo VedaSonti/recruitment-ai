@@ -144,24 +144,33 @@ export default function CandidateReviewPage() {
     }
 
     let cancelled = false;
-    const timer = window.setTimeout(() => {
-      void retryInterviewAssessment(activeInterviewMatchId)
-        .then(() => getInterviewByMatch(activeInterviewMatchId))
-        .then((updated) => {
-          if (!cancelled) {
-            setInterviewResult(updated as InterviewResult);
-          }
-        })
-        .catch((error) => {
-          console.error("[interview-assessment] Automatic continuation failed", {
-            errorType: error instanceof Error ? error.name : "UnknownError",
+    let timer: number | undefined;
+    const continueAssessment = () => {
+      timer = window.setTimeout(() => {
+        void retryInterviewAssessment(activeInterviewMatchId)
+          .then(() => getInterviewByMatch(activeInterviewMatchId))
+          .then((updated) => {
+            if (!cancelled) {
+              setInterviewResult(updated as InterviewResult);
+            }
+          })
+          .catch((error) => {
+            console.error("[interview-assessment] Automatic continuation failed", {
+              errorType: error instanceof Error ? error.name : "UnknownError",
+            });
+            if (!cancelled) {
+              continueAssessment();
+            }
           });
-        });
-    }, 10000);
+      }, 10000);
+    };
+    continueAssessment();
 
     return () => {
       cancelled = true;
-      window.clearTimeout(timer);
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+      }
     };
   }, [activeInterviewMatchId, interviewResult, showInterviewModal]);
 

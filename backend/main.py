@@ -1077,6 +1077,11 @@ async def ensure_match_uniqueness() -> None:
         "[recording observations] startup "
         f"face_package={analysis_status['face_landmarker_package']} "
         f"face_model={analysis_status['face_landmarker_model']} "
+        f"face_model_configured_path={analysis_status['face_landmarker_configured_path'] or 'unset'} "
+        f"face_model_resolved_path={analysis_status['face_landmarker_resolved_path']} "
+        f"face_model_exists={analysis_status['face_landmarker_model_exists']} "
+        f"face_model_size_bytes={analysis_status['face_landmarker_model_size_bytes']} "
+        f"face_model_packaged_fallback={analysis_status['face_landmarker_used_packaged_fallback']} "
         f"speaker_package={analysis_status['speaker_diarization_package']} "
         f"speaker_token={analysis_status['speaker_diarization_token']} "
         f"speaker_model={analysis_status['speaker_diarization_model']}"
@@ -1668,6 +1673,10 @@ async def get_interview_by_match(match_id: str):
         "responses": response_payloads,
         "assessment": interview.get("assessment"),
         "video_analysis_status": video_analysis_status,
+        "video_analysis_stage": interview.get("video_analysis_stage"),
+        "video_analysis_next_stage": (
+            interview.get("video_analysis_progress") or {}
+        ).get("next_stage"),
         "video_analysis": video_analysis,
         "cv_consistency": interview.get("cv_consistency"),
         "expires_at": interview["expires_at"].isoformat(),
