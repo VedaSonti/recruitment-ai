@@ -6,10 +6,7 @@
     },
     "backend": {
       "root": "backend",
-      "entrypoint": "main:app",
-      "includeFiles": [
-        "models/mediapipe/face_landmarker.task"
-      ]
+      "entrypoint": "main:app"
     }
   },
   "rewrites": [
