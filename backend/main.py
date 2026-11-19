@@ -1595,7 +1595,7 @@ Example format: ["Question one?", "Question two?", "Question three?", "Question 
       </div>
       <p style="color:#666;">This link expires on
          {expires_at.strftime('%B %d, %Y')}.</p>
-      <p>Best regards,<br>iSOFT Recruitment Team</p>
+      <p>Best regards,<br>Talent iSOFT</p>
     </div>"""
 
     email_sent = send_email(

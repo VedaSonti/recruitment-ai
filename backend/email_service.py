@@ -1,4 +1,4 @@
-"""Replaceable email delivery service using the project's existing Gmail SMTP settings."""
+"""Environment-configured SMTP delivery for Talent iSOFT."""
 
 import os
 import smtplib
@@ -13,16 +13,16 @@ class EmailService(Protocol):
 
 class SMTPEmailService:
     def __init__(self) -> None:
-        self.host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-        self.port = int(os.getenv("SMTP_PORT", "587"))
-        self.username = os.getenv("SMTP_USER", "")
+        self.host = os.getenv("SMTP_HOST", "").strip()
+        self.port = int(os.getenv("SMTP_PORT", "0"))
+        self.username = os.getenv("SMTP_USER", "").strip()
         self.password = os.getenv("SMTP_PASSWORD", "")
-        self.from_address = os.getenv("EMAIL_FROM", "") or self.username
-        self.from_name = os.getenv("EMAIL_FROM_NAME", "iSOFT Recruitment")
+        self.from_address = os.getenv("EMAIL_FROM", "").strip() or self.username
+        self.from_name = os.getenv("EMAIL_FROM_NAME", "Talent iSOFT").strip() or "Talent iSOFT"
 
     def send_html(self, to_address: str, subject: str, html_body: str) -> bool:
-        if not self.username or not self.password:
-            print("[email] SMTP credentials are not configured")
+        if not self.host or not self.port or not self.username or not self.password:
+            print("[email] SMTP configuration is incomplete")
             return False
 
         try:

@@ -266,7 +266,7 @@ def _reset_email_html(full_name: str, reset_url: str) -> str:
     return f"""
     <div style="font-family:Arial,sans-serif;background:#f7f3f4;padding:32px;color:#333333">
       <div style="max-width:600px;margin:auto;background:white;border-radius:12px;overflow:hidden;border:1px solid #ead7db">
-        <div style="background:#5C0D1B;padding:24px 30px;color:white"><strong style="font-size:22px;color:#E01111">iSOFT</strong> Recruitment</div>
+        <div style="background:#5C0D1B;padding:24px 30px;color:white"><strong style="font-size:22px;color:#E01111">Talent iSOFT</strong></div>
         <div style="padding:30px">
           <h1 style="font-size:24px;margin:0 0 16px">Reset your password</h1>
           <p>Hello {escape(full_name)},</p>
@@ -307,7 +307,7 @@ async def forgot_password(body: ForgotPasswordRequest):
         await run_in_threadpool(
             send_email,
             user["email"],
-            "Reset your iSOFT Recruitment password",
+            "Reset your Talent iSOFT password",
             _reset_email_html(user.get("full_name") or "Recruiter", reset_url),
         )
     except Exception as exc:
