@@ -1,6 +1,7 @@
 """Recruiter authentication, secure sessions, and password-reset workflow."""
 
 import hashlib
+import logging
 import os
 import re
 import secrets
@@ -24,6 +25,7 @@ from db import password_reset_tokens_collection, recruiter_users_collection
 from email_service import send_email
 
 
+logger = logging.getLogger(__name__)
 APP_ENV = os.getenv("APP_ENV", "development").lower()
 AUTH_COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "recruitment_session")
 AUTH_SESSION_HOURS = max(1, int(os.getenv("AUTH_SESSION_HOURS", "8")))
@@ -83,7 +85,23 @@ def hash_password(password: str) -> str:
 def verify_password(password_hash: str, password: str) -> bool:
     try:
         return bool(password_hasher.verify(password_hash, password))
-    except (VerifyMismatchError, VerificationError, InvalidHashError):
+    except VerifyMismatchError as exc:
+        logger.warning(
+            "auth_password_verification_failed exception_class=%s",
+            type(exc).__name__,
+        )
+        return False
+    except InvalidHashError as exc:
+        logger.warning(
+            "auth_password_verification_failed exception_class=%s",
+            type(exc).__name__,
+        )
+        return False
+    except VerificationError as exc:
+        logger.warning(
+            "auth_password_verification_failed exception_class=%s",
+            type(exc).__name__,
+        )
         return False
 
 
@@ -220,6 +238,14 @@ async def login(body: LoginRequest, request: Request, response: Response):
     user = await recruiter_users_collection.find_one({"email_normalized": normalized})
     stored_hash = user.get("password_hash", "") if user else _dummy_password_hash
     password_valid = verify_password(stored_hash, body.password)
+
+    if not user:
+        logger.warning("auth_login_rejected reason=user_not_found")
+    elif not password_valid:
+        logger.warning("auth_login_rejected reason=password_verification_failed")
+    elif not user.get("is_active"):
+        logger.warning("auth_login_rejected reason=account_inactive")
+
     if not user or not password_valid or not user.get("is_active"):
         raise HTTPException(401, "Invalid email or password")
 
